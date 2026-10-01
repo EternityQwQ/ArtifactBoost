@@ -21,7 +21,8 @@ ghproxy 等公开镜像无法携带你的 Token 去请求这个接口，所以�
 - 浏览自己/协作/组织的仓库，支持远程搜索
 - 查看 Workflow 运行记录（状态、分支、编号、时间）
 - 查看每次运行的产物列表（名称、大小、是否过期）
-- **1–16 可调并发分段下载**，实时显示进度、百分比和速度
+- **1–32 可调并发分段下载**（默认 16），实时显示进度、百分比和速度
+- **智能加速通道**：直连 Azure 太慢时，自动在「直连 / 公共镜像」之间测速，挑最快的一条下载
 - 自动重试（每段最多 3 次）、可随时取消
 - 下载完成后一键导出到「文件」App / 分享（也可以在「文件」App → 我的 iPhone → ArtifactBoost → Artifacts 里直接找到）
 
@@ -78,12 +79,42 @@ ghproxy 等公开镜像无法携带你的 Token 去请求这个接口，所以�
 ## 使用
 
 仓库 → 选择一次 Workflow 运行 → 产物列表 → 点「加速下载」→ 完成后「导出 / 保存到文件」。
-并发数建议保持默认 8；网络差时可调低，网络好时可拉到 16。
+
+产物列表顶部的「加速设置」有两项：
+
+**并发连接数（默认 16）** —— 单条连接到 GitHub 的 Azure 存储通常只有几十~几百 KB/s，
+多开连接是提速的主要手段。默认 16 足够；网络很好可以拉到 32。
+
+**下载通道**
+- `直连`：直接连 GitHub 的 Azure 存储，最安全，但国内经常只有几十 KB/s
+- `智能加速`（默认）：先给「直连」和几个公共镜像各测 512KB，挑最快的一条再开始下载。
+  **私有仓库会自动强制走直连**，公开仓库才可能走镜像
+- `自定义`：填自己的加速前缀，比如自建的 Cloudflare Worker / 反向代理地址
+
+> 公共镜像只中转「已经签名的产物下载地址」，整个过程不经过你的 Token；
+> 但产物数据本身会经过第三方服务器，因此私有仓库一律不启用镜像。
+
+### 自建加速前缀（可选，最稳）
+
+在 Cloudflare Workers 新建一个 Worker，粘贴下面几行，把生成的地址填进 App 的「自定义」：
+
+```js
+export default {
+  async fetch(request) {
+    const target = new URL(request.url).pathname.slice(1) + new URL(request.url).search
+    return fetch(target, { headers: request.headers, method: request.method })
+  }
+}
+```
+
+然后填 `https://你的worker名.workers.dev/` 即可（Range 请求会自动透传，支持多线程分段）。
 
 ## 注意事项
 
 - 下载时尽量保持 App 在前台：已申请系统后台任务，切走后有约 30 秒缓冲，之后 iOS 仍会暂停网络任务
 - 大文件建议在 Wi-Fi 下下载
+- 国内直连 GitHub 的 Azure 存储常见只有几十 KB/s，这是链路的限制而不是 App 的限制；
+  多开连接与「智能加速」通道就是为了绕开它，走镜像/自建反代通常能到几 MB/s
 - GitHub 产物默认保留 90 天，过期的产物（列表里标红「已过期」）无法下载
 - 加速的原理是绕过单连接限速，无法突破你本地网络的物理带宽上限
 - Token 不要泄露给他人；怀疑泄露时到 GitHub Settings 里点 Revoke 即可
@@ -97,6 +128,7 @@ Sources/
 ├── KeychainHelper.swift     系统钥匙串读写
 ├── GitHubModels.swift       API 数据模型
 ├── GitHubClient.swift       GitHub REST API 客户端（含 302 签名地址解析）
+├── DownloadRoute.swift      下载通道（直连 / 镜像 / 自定义）与测速选路
 ├── DownloadEngine.swift     多线程 Range 分段下载引擎（核心加速逻辑）
 ├── DownloadManager.swift    下载任务状态管理（进度/取消/重试）
 ├── Formatters.swift         字节数/网速格式化
