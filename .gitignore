@@ -5,6 +5,11 @@
 ## User settings
 xcuserdata/
 
+## XcodeGen 生成物（源文件是 project.yml / Info.plist 由 xcodegen generate 产出）
+ArtifactBoost.xcodeproj/
+Info.plist
+DerivedData/
+
 ## Obj-C/Swift specific
 *.hmap
 

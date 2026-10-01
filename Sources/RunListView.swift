@@ -94,7 +94,7 @@ struct RunListView: View {
         do {
             runs = try await client.workflowRuns(repo: repo)
         } catch {
-            errorMessage = error.localizedDescription
+            errorMessage = session.message(for: error)
         }
     }
 }

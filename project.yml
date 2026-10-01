@@ -1,6 +1,18 @@
 name: ArtifactBoost
+
 options:
   bundleIdPrefix: com.local
+  deploymentTarget:
+    iOS: "16.0"
+  createIntermediateGroups: true
+  groupSortPosition: top
+
+settings:
+  base:
+    # 固定 Swift 5 语言模式：Xcode 16 的 Swift 6 严格并发检查会拒绝本项目里的
+    # URLSession 代理写法，显式声明可保证本地与 CI 行为一致
+    SWIFT_VERSION: "5.0"
+
 targets:
   ArtifactBoost:
     type: application
@@ -8,10 +20,40 @@ targets:
     deploymentTarget: "16.0"
     sources:
       - path: Sources
+    # 显式维护 Info.plist：GENERATE_INFOPLIST_FILE 的 INFOPLIST_KEY_* 不支持
+    # UIFileSharingEnabled，会导致「文件」App 看不到下载目录
+    info:
+      path: Info.plist
+      properties:
+        CFBundleDisplayName: ArtifactBoost
+        CFBundleName: $(PRODUCT_NAME)
+        CFBundleIdentifier: $(PRODUCT_BUNDLE_IDENTIFIER)
+        CFBundleExecutable: $(EXECUTABLE_NAME)
+        CFBundlePackageType: APPL
+        CFBundleShortVersionString: $(MARKETING_VERSION)
+        CFBundleVersion: $(CURRENT_PROJECT_VERSION)
+        LSRequiresIPhoneOS: true
+        UIApplicationSupportsIndirectInputEvents: true
+        UILaunchScreen: {}
+        UISupportedInterfaceOrientations:
+          - UIInterfaceOrientationPortrait
+        UISupportedInterfaceOrientations~ipad:
+          - UIInterfaceOrientationPortrait
+          - UIInterfaceOrientationPortraitUpsideDown
+          - UIInterfaceOrientationLandscapeLeft
+          - UIInterfaceOrientationLandscapeRight
+        # 让「文件」App 直接看到下载目录：我的 iPhone → ArtifactBoost → Artifacts
+        UIFileSharingEnabled: true
+        LSSupportsOpeningDocumentsInPlace: true
     settings:
       base:
+        PRODUCT_NAME: ArtifactBoost
         PRODUCT_BUNDLE_IDENTIFIER: com.local.ArtifactBoost
-        GENERATE_INFOPLIST_FILE: YES
-        INFOPLIST_KEY_UILaunchScreen_Generation: YES
-        INFOPLIST_KEY_UISupportedInterfaceOrientations: UIInterfaceOrientationPortrait
+        MARKETING_VERSION: "1.1"
+        CURRENT_PROJECT_VERSION: "1"
         TARGETED_DEVICE_FAMILY: "1,2"
+        CODE_SIGN_STYLE: Automatic
+    # 显式生成共享 scheme，保证 CI 里 xcodebuild -scheme ArtifactBoost 一定能用
+    scheme:
+      testTargets: []
+      gatherCoverageData: false
