@@ -73,7 +73,7 @@ struct RepoDetailView: View {
         .navigationTitle(repo.name)
         .navigationBarTitleDisplayMode(.inline)
         .task(id: tab) { await load(tab) }
-        .refreshable { await load(tab) }
+        .refreshable { await load(tab, force: true) }
         .navigationDestination(for: GHWorkflowRun.self) { run in
             RunDetailView(repo: repo, run: run)
         }
@@ -190,7 +190,7 @@ struct RepoDetailView: View {
 
     // MARK: - 数据
 
-    private func load(_ tab: RepoTab) async {
+    private func load(_ tab: RepoTab, force: Bool = false) async {
         guard let client = session.client else { return }
         isLoading = true
         errorMessage = nil
@@ -198,11 +198,11 @@ struct RepoDetailView: View {
         do {
             switch tab {
             case .builds:
-                if runs.isEmpty { runs = try await client.workflowRuns(repo: repo) }
+                if runs.isEmpty || force { runs = try await client.workflowRuns(repo: repo) }
             case .releases:
-                if releases.isEmpty { releases = try await client.releases(repo: repo) }
+                if releases.isEmpty || force { releases = try await client.releases(repo: repo) }
             case .source:
-                if branches.isEmpty {
+                if branches.isEmpty || force {
                     branches = try await client.branches(repo: repo)
                     if selectedRef.isEmpty, let first = branches.first {
                         selectedRef = first.name
