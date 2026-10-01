@@ -85,50 +85,65 @@ struct RepoDetailView: View {
     // MARK: - 顶部卡片
 
     private var hero: some View {
-        VStack(alignment: .leading, spacing: 12) {
+        VStack(alignment: .leading, spacing: 10) {
             HStack(spacing: 10) {
-                Image(systemName: repo.isPrivate ? "lock.fill" : "book.closed.fill")
-                    .font(.system(size: 18, weight: .semibold))
-                    .foregroundStyle(.white)
+                IconBadge(systemName: repo.isPrivate ? "lock.fill" : "book.closed.fill",
+                          color: repo.isPrivate ? Theme.yellow : Theme.blue,
+                          size: 38)
+
                 VStack(alignment: .leading, spacing: 2) {
-                    Text(repo.name)
-                        .font(.headline)
-                        .foregroundStyle(.white)
-                        .lineLimit(1)
-                    Text(repo.fullName)
-                        .font(.caption2)
-                        .foregroundStyle(.white.opacity(0.75))
-                        .lineLimit(1)
+                    HStack(spacing: 0) {
+                        Text(repo.owner + "/")
+                            .font(.headline)
+                            .foregroundStyle(Theme.muted)
+                        Text(repo.name)
+                            .font(.headline)
+                            .foregroundStyle(Theme.blue)
+                    }
+                    .lineLimit(1)
+
+                    if let date = repo.updatedAt {
+                        Text("更新于 \(date.formatted(date: .numeric, time: .shortened))")
+                            .font(.caption2)
+                            .foregroundStyle(Theme.subtle)
+                    }
                 }
-                Spacer()
+
+                Spacer(minLength: 0)
+
+                if repo.isPrivate {
+                    StatusPill(text: "私有", color: Theme.yellow, systemImage: "lock.fill")
+                }
             }
 
-            HStack(spacing: 8) {
-                if repo.isPrivate {
-                    StatusPill(text: "私有", color: .white)
-                }
+            if let description = repo.description, !description.isEmpty {
+                Text(description)
+                    .font(.footnote)
+                    .foregroundStyle(Theme.muted)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+
+            HStack(spacing: 14) {
                 if let language = repo.language {
-                    StatusPill(text: language, color: .white)
+                    LanguageLabel(language: language)
                 }
                 if let stars = repo.stargazersCount, stars > 0 {
-                    StatusPill(text: "★ \(stars)", color: .white)
+                    StatLabel(systemName: "star.fill", text: formatCount(stars))
+                }
+                if let forks = repo.forksCount, forks > 0 {
+                    StatLabel(systemName: "arrow.triangle.branch", text: formatCount(forks))
+                }
+                Spacer(minLength: 0)
+                Link(destination: URL(string: "https://github.com/\(repo.fullName)")!) {
+                    HStack(spacing: 3) {
+                        Text("在 GitHub 打开")
+                        Image(systemName: "arrow.up.right")
+                    }
+                    .font(.caption2.weight(.semibold))
                 }
             }
-            .opacity(0.95)
-
-            if let date = repo.updatedAt {
-                Text("最近更新 \(date.formatted(date: .numeric, time: .shortened))")
-                    .font(.caption2)
-                    .foregroundStyle(.white.opacity(0.75))
-            }
         }
-        .padding(16)
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .background(
-            LinearGradient(colors: [Theme.accent, Theme.purple],
-                           startPoint: .topLeading, endPoint: .bottomTrailing),
-            in: RoundedRectangle(cornerRadius: 18, style: .continuous)
-        )
+        .card()
     }
 
     // MARK: - 各分页

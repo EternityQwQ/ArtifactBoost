@@ -65,40 +65,36 @@ struct ReleaseDetailView: View {
     private var header: some View {
         VStack(alignment: .leading, spacing: 10) {
             HStack(spacing: 10) {
-                Image(systemName: "shippingbox.fill")
-                    .font(.system(size: 20, weight: .semibold))
-                    .foregroundStyle(.white)
+                IconBadge(systemName: "shippingbox.fill", color: Theme.purple, size: 38)
+
                 VStack(alignment: .leading, spacing: 2) {
                     Text(release.displayName)
                         .font(.headline)
-                        .foregroundStyle(.white)
                         .lineLimit(2)
-                    Text("\(repo.name) · \(release.tagName)")
+                    Text("\(repo.fullName) · \(release.tagName)")
                         .font(.caption2)
-                        .foregroundStyle(.white.opacity(0.8))
+                        .foregroundStyle(Theme.subtle)
+                        .lineLimit(1)
                 }
+
                 Spacer(minLength: 0)
+
+                if release.prerelease {
+                    StatusPill(text: "预发布", color: Theme.orange)
+                } else if release.draft {
+                    StatusPill(text: "草稿", color: Theme.muted)
+                } else {
+                    StatusPill(text: "正式版", color: Theme.green)
+                }
             }
 
             HStack(spacing: 8) {
-                if release.prerelease {
-                    StatusPill(text: "预发布", color: .white)
-                } else if release.draft {
-                    StatusPill(text: "草稿", color: .white)
-                } else {
-                    StatusPill(text: "正式版", color: .white)
-                }
                 if let date = release.publishedAt {
-                    StatusPill(text: date.formatted(date: .numeric, time: .omitted), color: .white)
+                    StatusPill(text: date.formatted(date: .numeric, time: .omitted), color: Theme.muted)
                 }
+                StatusPill(text: "\(release.assets.count) 个附件", color: Theme.muted)
             }
         }
-        .padding(16)
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .background(
-            LinearGradient(colors: [Theme.purple, Theme.accent],
-                           startPoint: .topLeading, endPoint: .bottomTrailing),
-            in: RoundedRectangle(cornerRadius: 18, style: .continuous)
-        )
+        .card()
     }
 }

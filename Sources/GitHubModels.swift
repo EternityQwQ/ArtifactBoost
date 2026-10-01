@@ -18,14 +18,17 @@ struct GHRepo: Codable, Identifiable, Hashable {
     let defaultBranch: String?
     let language: String?
     let stargazersCount: Int?
+    let forksCount: Int?
+    let description: String?
 
     enum CodingKeys: String, CodingKey {
-        case id, name, language
+        case id, name, language, description
         case fullName = "full_name"
         case isPrivate = "private"
         case updatedAt = "updated_at"
         case defaultBranch = "default_branch"
         case stargazersCount = "stargazers_count"
+        case forksCount = "forks_count"
     }
 
     var owner: String { fullName.split(separator: "/").first.map(String.init) ?? "" }

@@ -30,22 +30,17 @@ struct LoginView: View {
     }
 
     private var hero: some View {
-        VStack(spacing: 12) {
-            Image(systemName: "bolt.horizontal.circle.fill")
-                .font(.system(size: 58))
-                .foregroundStyle(
-                    LinearGradient(colors: [Theme.accent, Theme.purple],
-                                   startPoint: .topLeading, endPoint: .bottomTrailing)
-                )
+        VStack(spacing: 10) {
+            IconBadge(systemName: "bolt.horizontal.fill", color: Theme.blue, size: 64)
             Text("ArtifactBoost")
-                .font(.system(size: 26, weight: .bold, design: .rounded))
+                .font(.system(size: 24, weight: .bold))
             Text("GitHub 产物 · 正式版 · 源码 · 构建日志\n多通道并发加速下载")
                 .font(.footnote)
                 .multilineTextAlignment(.center)
-                .foregroundStyle(.secondary)
+                .foregroundStyle(Theme.muted)
         }
-        .padding(.top, 24)
-        .padding(.bottom, 4)
+        .padding(.top, 22)
+        .padding(.bottom, 2)
     }
 
     private var tokenCard: some View {
@@ -71,7 +66,12 @@ struct LoginView: View {
                     }
                 }
                 .font(.footnote)
-                .foregroundStyle(Theme.accent)
+                .foregroundStyle(Theme.blue)
+
+                Text("想下载别人的公开仓库：classic Token 勾 repo 即可；fine-grained Token 需要在 Account permissions 里允许读取公开仓库。")
+                    .font(.caption2)
+                    .foregroundStyle(Theme.subtle)
+                    .fixedSize(horizontal: false, vertical: true)
             }
         }
     }
@@ -92,6 +92,7 @@ struct LoginView: View {
             .padding(.vertical, 6)
         }
         .buttonStyle(.borderedProminent)
+        .tint(Theme.green)
         .controlSize(.large)
         .disabled(!canSubmit)
     }
@@ -105,10 +106,7 @@ struct LoginView: View {
     }
 
     private func card<Content: View>(@ViewBuilder content: () -> Content) -> some View {
-        content()
-            .padding(16)
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .background(Color(.secondarySystemGroupedBackground), in: RoundedRectangle(cornerRadius: 16, style: .continuous))
+        content().card()
     }
 
     private func login() {

@@ -4,7 +4,6 @@ struct RepoListView: View {
     @EnvironmentObject private var session: SessionManager
     @State private var repos: [GHRepo] = []
     @State private var isLoading = false
-    @State private var isSearchingRemote = false
     @State private var errorMessage: String?
     @State private var searchText = ""
 
@@ -19,27 +18,23 @@ struct RepoListView: View {
                 Section { ErrorBanner(text: errorMessage) }
             }
 
-            if shownRepos.isEmpty && !isLoading && !isSearchingRemote {
-                EmptyStateView(systemName: "shippingbox",
+            if shownRepos.isEmpty && !isLoading {
+                EmptyStateView(systemName: "square.stack.3d.up",
                                title: searchText.isEmpty ? "还没有仓库" : "本地没有匹配的仓库",
                                message: searchText.isEmpty
-                                   ? "下拉刷新试试，或在搜索框输入关键词后回车远程搜索"
-                                   : "在搜索框回车可直接到 GitHub 上远程搜索")
+                                   ? "下拉刷新；想下载别人的公开仓库，去「搜索」Tab 直接搜"
+                                   : "换个关键词，或去「搜索」Tab 搜全站")
             }
 
             if !shownRepos.isEmpty {
                 Section {
                     ForEach(shownRepos) { repo in
                         NavigationLink(value: repo) {
-                            RepoRow(repo: repo)
+                            RepoCardRow(repo: repo)
                         }
                     }
                 } header: {
-                    HStack {
-                        Text("共 \(shownRepos.count) 个仓库")
-                        Spacer()
-                        if isSearchingRemote { ProgressView().controlSize(.mini) }
-                    }
+                    Text("共 \(shownRepos.count) 个仓库")
                 }
             }
 
@@ -55,14 +50,7 @@ struct RepoListView: View {
         }
         .listStyle(.insetGrouped)
         .navigationTitle("我的仓库")
-        .searchable(text: $searchText, prompt: "筛选仓库，回车远程搜索")
-        .onSubmit(of: .search) {
-            if searchText.trimmingCharacters(in: .whitespaces).isEmpty {
-                Task { await loadRepos() }
-            } else {
-                Task { await remoteSearch() }
-            }
-        }
+        .searchable(text: $searchText, prompt: "筛选我的仓库")
         .navigationDestination(for: GHRepo.self) { repo in
             RepoDetailView(repo: repo)
         }
@@ -87,57 +75,56 @@ struct RepoListView: View {
             errorMessage = session.message(for: error)
         }
     }
-
-    private func remoteSearch() async {
-        guard let client = session.client, !searchText.isEmpty else { return }
-        isSearchingRemote = true
-        errorMessage = nil
-        defer { isSearchingRemote = false }
-        do {
-            repos = try await client.searchRepos(keyword: searchText)
-        } catch {
-            errorMessage = session.message(for: error)
-        }
-    }
 }
 
-private struct RepoRow: View {
+/// 仓库行：GitHub 移动端风格（owner/repo 双色标题 + 描述 + 语言/星标）
+struct RepoCardRow: View {
     let repo: GHRepo
 
     var body: some View {
-        HStack(spacing: 12) {
+        HStack(alignment: .top, spacing: 12) {
             IconBadge(systemName: repo.isPrivate ? "lock.fill" : "book.closed.fill",
-                      color: repo.isPrivate ? Theme.orange : Theme.accent)
+                      color: repo.isPrivate ? Theme.yellow : Theme.blue)
 
-            VStack(alignment: .leading, spacing: 3) {
-                Text(repo.name)
-                    .font(.subheadline.weight(.semibold))
-                    .lineLimit(1)
-                HStack(spacing: 8) {
-                    if let owner = repo.fullName.split(separator: "/").first {
-                        Text(String(owner))
-                    }
-                    if let language = repo.language {
-                        Text("·")
-                        Text(language)
-                    }
-                    if let stars = repo.stargazersCount, stars > 0 {
-                        Text("·")
-                        Label("\(stars)", systemImage: "star.fill")
-                            .labelStyle(.titleAndIcon)
-                    }
+            VStack(alignment: .leading, spacing: 4) {
+                HStack(spacing: 0) {
+                    Text(repo.owner + "/")
+                        .font(.subheadline)
+                        .foregroundStyle(Theme.muted)
+                    Text(repo.name)
+                        .font(.subheadline.weight(.semibold))
+                        .foregroundStyle(Theme.blue)
                 }
-                .font(.caption2)
-                .foregroundStyle(.secondary)
                 .lineLimit(1)
 
+                if let description = repo.description, !description.isEmpty {
+                    Text(description)
+                        .font(.caption)
+                        .foregroundStyle(Theme.muted)
+                        .lineLimit(2)
+                }
+
+                HStack(spacing: 12) {
+                    if let language = repo.language {
+                        LanguageLabel(language: language)
+                    }
+                    if let stars = repo.stargazersCount, stars > 0 {
+                        StatLabel(systemName: "star.fill", text: formatCount(stars))
+                    }
+                    if let forks = repo.forksCount, forks > 0 {
+                        StatLabel(systemName: "arrow.triangle.branch", text: formatCount(forks))
+                    }
+                }
+
                 if let date = repo.updatedAt {
-                    Text("更新于 \(date.formatted(date: .numeric, time: .shortened))")
+                    Text("更新于 \(date.formatted(date: .numeric, time: .omitted))")
                         .font(.caption2)
-                        .foregroundStyle(.tertiary)
+                        .foregroundStyle(Theme.subtle)
                 }
             }
+
+            Spacer(minLength: 0)
         }
-        .padding(.vertical, 2)
+        .padding(.vertical, 3)
     }
 }
