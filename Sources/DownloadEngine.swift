@@ -185,18 +185,18 @@ private final class ChunkDelegate: NSObject, URLSessionDownloadDelegate, @unchec
 /// 单连接被限速时，多并发能显著提升总速度。
 final class DownloadEngine: @unchecked Sendable {
     private let lock = NSLock()
-    private var session: URLSession?
+    private var sessions: [URLSession] = []
 
     func cancel() {
         lock.lock()
-        let s = session
+        let current = sessions
         lock.unlock()
-        s?.invalidateAndCancel()
+        current.forEach { $0.invalidateAndCancel() }
     }
 
-    private func setSession(_ s: URLSession?) {
+    private func setSessions(_ newValue: [URLSession]) {
         lock.lock()
-        session = s
+        sessions = newValue
         lock.unlock()
     }
 
@@ -239,16 +239,26 @@ final class DownloadEngine: @unchecked Sendable {
             return DownloadResult(fileURL: outURL, averageSpeed: Self.speed(bytes: size, since: startedAt))
         }
 
-        let delegate = ChunkDelegate(accumulator: accumulator, tempDir: tempDir)
-        let config = URLSessionConfiguration.ephemeral
-        config.timeoutIntervalForRequest = 120
-        config.timeoutIntervalForResource = 3600
-        config.httpMaximumConnectionsPerHost = max(1, connections)
-        let session = URLSession(configuration: config, delegate: delegate, delegateQueue: nil)
-        setSession(session)
+        // 关键：Cloudflare 这类 CDN 会协商 HTTP/2，所有请求会被多路复用到同一条 TCP 连接上，
+        // 长链路下单连接带宽就是天花板，开再多"连接"也没用。
+        // 每个 URLSession 有独立的连接池，拆成多个会话才能真正拿到多条并行连接。
+        let sessionCount = min(4, max(1, connections / 8))
+        let perSessionLimit = max(1, connections / sessionCount)
+        var sessions: [URLSession] = []
+        var delegates: [ChunkDelegate] = []
+        for _ in 0..<sessionCount {
+            let config = URLSessionConfiguration.ephemeral
+            config.timeoutIntervalForRequest = 120
+            config.timeoutIntervalForResource = 3600
+            config.httpMaximumConnectionsPerHost = perSessionLimit
+            let delegate = ChunkDelegate(accumulator: accumulator, tempDir: tempDir)
+            sessions.append(URLSession(configuration: config, delegate: delegate, delegateQueue: nil))
+            delegates.append(delegate)
+        }
+        setSessions(sessions)
         defer {
-            session.invalidateAndCancel()
-            setSession(nil)
+            sessions.forEach { $0.invalidateAndCancel() }
+            setSessions([])
         }
 
         let chunks = makeChunks(total: total, connections: connections)
@@ -258,6 +268,9 @@ final class DownloadEngine: @unchecked Sendable {
         try await withThrowingTaskGroup(of: (Int, URL).self) { group in
             for (index, chunk) in chunks.enumerated() {
                 let url = urls[min(assignment[index], urls.count - 1)]
+                let slot = index % sessions.count
+                let session = sessions[slot]
+                let delegate = delegates[slot]
                 group.addTask {
                     try await self.downloadChunk(url: url,
                                                  fallbackURL: url == fallbackURL ? nil : fallbackURL,
@@ -373,14 +386,13 @@ final class DownloadEngine: @unchecked Sendable {
         throw lastError
     }
 
+    /// 分块数取连接数的 4 倍：多出来的分块由 URLSession 内部排队，
+    /// 哪条连接先空出来就接下一条，既避免"最慢的那块"拖住整体，也更容易吃满带宽。
+    /// 注意分块下限不能太大，否则小产物根本拆不出几段（这正是当初"开了加速还是几百 KB"的原因）。
     private func makeChunks(total: Int64, connections: Int) -> [Chunk] {
-        // 每段最小 512KB：原来写 2MB 会导致 1~10MB 的产物只开 1~5 个连接，
-        // 等于完全没并发（这是"开了加速还是几百 KB"的主因）
-        let minChunk: Int64 = 512 * 1024
-        var count = Int64(max(1, min(connections, 32)))
-        if total / count < minChunk {
-            count = max(1, total / minChunk)
-        }
+        let minChunk: Int64 = 256 * 1024
+        let maxChunks = Int64(max(1, min(connections, 64))) * 4
+        let count = min(maxChunks, max(1, total / minChunk))
         let size = (total + count - 1) / count
         var chunks: [Chunk] = []
         var start: Int64 = 0
