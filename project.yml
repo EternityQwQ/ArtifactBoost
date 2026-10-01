@@ -20,6 +20,31 @@ targets:
     deploymentTarget: "16.0"
     sources:
       - path: Sources
+    # 显式维护 Info.plist：GENERATE_INFOPLIST_FILE 的 INFOPLIST_KEY_* 不支持
+    # UIFileSharingEnabled，会导致「文件」App 看不到下载目录
+    info:
+      path: Info.plist
+      properties:
+        CFBundleDisplayName: ArtifactBoost
+        CFBundleName: $(PRODUCT_NAME)
+        CFBundleIdentifier: $(PRODUCT_BUNDLE_IDENTIFIER)
+        CFBundleExecutable: $(EXECUTABLE_NAME)
+        CFBundlePackageType: APPL
+        CFBundleShortVersionString: $(MARKETING_VERSION)
+        CFBundleVersion: $(CURRENT_PROJECT_VERSION)
+        LSRequiresIPhoneOS: true
+        UIApplicationSupportsIndirectInputEvents: true
+        UILaunchScreen: {}
+        UISupportedInterfaceOrientations:
+          - UIInterfaceOrientationPortrait
+        UISupportedInterfaceOrientations~ipad:
+          - UIInterfaceOrientationPortrait
+          - UIInterfaceOrientationPortraitUpsideDown
+          - UIInterfaceOrientationLandscapeLeft
+          - UIInterfaceOrientationLandscapeRight
+        # 让「文件」App 直接看到下载目录：我的 iPhone → ArtifactBoost → Artifacts
+        UIFileSharingEnabled: true
+        LSSupportsOpeningDocumentsInPlace: true
     settings:
       base:
         PRODUCT_NAME: ArtifactBoost
@@ -27,14 +52,6 @@ targets:
         MARKETING_VERSION: "1.1"
         CURRENT_PROJECT_VERSION: "1"
         TARGETED_DEVICE_FAMILY: "1,2"
-        GENERATE_INFOPLIST_FILE: YES
-        INFOPLIST_KEY_CFBundleDisplayName: ArtifactBoost
-        INFOPLIST_KEY_UILaunchScreen_Generation: YES
-        INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents: YES
-        INFOPLIST_KEY_UISupportedInterfaceOrientations: UIInterfaceOrientationPortrait
-        # 让「文件」App 能直接看到下载目录（我的 iPhone → ArtifactBoost）
-        INFOPLIST_KEY_UIFileSharingEnabled: YES
-        INFOPLIST_KEY_LSSupportsOpeningDocumentsInPlace: YES
         CODE_SIGN_STYLE: Automatic
     # 显式生成共享 scheme，保证 CI 里 xcodebuild -scheme ArtifactBoost 一定能用
     scheme:
