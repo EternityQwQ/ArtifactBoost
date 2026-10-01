@@ -10,18 +10,40 @@ struct ArtifactListView: View {
     @State private var isLoading = false
     @State private var errorMessage: String?
 
+    @AppStorage("ab.connections") private var connections = 16
+    @AppStorage("ab.routeMode") private var routeMode: RouteMode = .smart
+    @AppStorage("ab.customPrefix") private var customPrefix = ""
+
     init(repo: GHRepo, run: GHWorkflowRun, client: GitHubClient) {
         self.repo = repo
         self.run = run
         _dm = StateObject(wrappedValue: DownloadManager(client: client))
     }
 
+    private var settings: DownloadSettings {
+        DownloadSettings(connections: connections, mode: routeMode, customPrefix: customPrefix)
+    }
+
     var body: some View {
         List {
             Section {
-                Stepper("并发连接数：\(dm.connections)", value: $dm.connections, in: 1...16)
+                Stepper("并发连接数：\(connections)", value: $connections, in: 1...32)
+                Picker("下载通道", selection: $routeMode) {
+                    ForEach(RouteMode.allCases) { mode in
+                        Text(mode.title).tag(mode)
+                    }
+                }
+                .pickerStyle(.segmented)
+                if routeMode == .custom {
+                    TextField("加速前缀，如 https://xxx.workers.dev/", text: $customPrefix)
+                        .textInputAutocapitalization(.never)
+                        .autocorrectionDisabled()
+                        .keyboardType(.URL)
+                }
+            } header: {
+                Text("加速设置")
             } footer: {
-                Text("连接数越多提速越明显（建议 8）。产物为 zip 压缩包，下载完成后可一键导出到「文件」App 或分享。")
+                Text("并发数默认 16：产物只有几 MB 时也能把连接开满。\n「智能加速」会先给直连和公共镜像测速，自动选最快的一条；镜像只中转已签名的产物地址、不接触你的 Token，但私有仓库请保持「直连」。")
             }
 
             if let errorMessage {
@@ -81,7 +103,7 @@ struct ArtifactListView: View {
             switch dm.state(for: artifact) {
             case .idle:
                 Button {
-                    dm.start(artifact: artifact, repo: repo)
+                    dm.start(artifact: artifact, repo: repo, settings: settings)
                 } label: {
                     Label("加速下载", systemImage: "bolt.horizontal.fill")
                         .frame(maxWidth: .infinity)
@@ -92,7 +114,7 @@ struct ArtifactListView: View {
             case .resolving:
                 HStack(spacing: 8) {
                     ProgressView()
-                    Text("正在获取下载地址…")
+                    Text(dm.routeSummary[artifact.id] ?? "正在获取下载地址…")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }
@@ -108,6 +130,11 @@ struct ArtifactListView: View {
                     }
                     .font(.caption)
                     .foregroundStyle(.secondary)
+                    if let summary = dm.routeSummary[artifact.id] {
+                        Text(summary)
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                    }
                     Button("取消", role: .destructive) {
                         dm.cancel(artifact: artifact)
                     }
@@ -119,6 +146,11 @@ struct ArtifactListView: View {
                     Label("下载完成", systemImage: "checkmark.circle.fill")
                         .foregroundStyle(.green)
                         .font(.subheadline)
+                    if let summary = dm.routeSummary[artifact.id] {
+                        Text(summary)
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                    }
                     HStack {
                         ShareLink(item: url) {
                             Label("导出 / 保存到文件", systemImage: "square.and.arrow.up")
@@ -126,7 +158,7 @@ struct ArtifactListView: View {
                         .buttonStyle(.borderedProminent)
                         Spacer()
                         Button("重新下载") {
-                            dm.start(artifact: artifact, repo: repo)
+                            dm.start(artifact: artifact, repo: repo, settings: settings)
                         }
                         .font(.caption)
                     }
@@ -138,7 +170,7 @@ struct ArtifactListView: View {
                         .font(.caption)
                         .foregroundStyle(.red)
                     Button("重试") {
-                        dm.start(artifact: artifact, repo: repo)
+                        dm.start(artifact: artifact, repo: repo, settings: settings)
                     }
                     .buttonStyle(.bordered)
                 }

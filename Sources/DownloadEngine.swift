@@ -21,6 +21,11 @@ enum DownloadError: LocalizedError, Equatable {
     }
 }
 
+struct DownloadResult {
+    let fileURL: URL
+    let averageSpeed: Double
+}
+
 private struct Chunk {
     let index: Int
     let start: Int64
@@ -196,9 +201,12 @@ final class DownloadEngine: @unchecked Sendable {
     }
 
     func download(signedURL: URL,
+                  route: DownloadRoute,
                   fileName: String,
                   connections: Int,
-                  progress: @escaping @Sendable (DownloadProgress) -> Void) async throws -> URL {
+                  progress: @escaping @Sendable (DownloadProgress) -> Void) async throws -> DownloadResult {
+        let startedAt = Date()
+        let requestURL = route.apply(to: signedURL)
         let fm = FileManager.default
         let tempDir = fm.temporaryDirectory.appendingPathComponent("ab-\(UUID().uuidString)", isDirectory: true)
         try fm.createDirectory(at: tempDir, withIntermediateDirectories: true)
@@ -212,12 +220,12 @@ final class DownloadEngine: @unchecked Sendable {
             outURL = outDir.appendingPathComponent("\(UUID().uuidString.prefix(6))-\(fileName)")
         }
 
-        let total = try await probeSize(url: signedURL)
+        let total = try await probeSize(url: requestURL)
         let accumulator = ProgressAccumulator(total: total ?? 0, handler: progress)
 
         // 服务器不支持分块（或探测不到体积）时，退化为单连接下载
         guard let total, total > 0 else {
-            let (tmp, resp) = try await URLSession.shared.download(from: signedURL)
+            let (tmp, resp) = try await URLSession.shared.download(from: requestURL)
             guard let http = resp as? HTTPURLResponse, (200..<300).contains(http.statusCode) else {
                 throw DownloadError.badResponse
             }
@@ -225,7 +233,7 @@ final class DownloadEngine: @unchecked Sendable {
             try fm.moveItem(at: tmp, to: outURL)
             let size = ((try? fm.attributesOfItem(atPath: outURL.path))?[.size] as? Int64) ?? 0
             await accumulator.finish(downloaded: size)
-            return outURL
+            return DownloadResult(fileURL: outURL, averageSpeed: Self.speed(bytes: size, since: startedAt))
         }
 
         let delegate = ChunkDelegate(accumulator: accumulator, tempDir: tempDir)
@@ -245,7 +253,7 @@ final class DownloadEngine: @unchecked Sendable {
         try await withThrowingTaskGroup(of: (Int, URL).self) { group in
             for chunk in chunks {
                 group.addTask {
-                    try await self.downloadChunk(signedURL: signedURL, chunk: chunk, session: session, delegate: delegate)
+                    try await self.downloadChunk(url: requestURL, chunk: chunk, session: session, delegate: delegate)
                 }
             }
             for try await part in group {
@@ -255,7 +263,11 @@ final class DownloadEngine: @unchecked Sendable {
 
         try merge(parts: parts, into: outURL, total: total)
         await accumulator.finish(downloaded: total)
-        return outURL
+        return DownloadResult(fileURL: outURL, averageSpeed: Self.speed(bytes: total, since: startedAt))
+    }
+
+    private static func speed(bytes: Int64, since start: Date) -> Double {
+        Double(bytes) / max(Date().timeIntervalSince(start), 0.05)
     }
 
     /// 按分块顺序合并，并校验最终体积，任何异常都会删掉半成品
@@ -286,14 +298,14 @@ final class DownloadEngine: @unchecked Sendable {
         }
     }
 
-    private func downloadChunk(signedURL: URL,
+    private func downloadChunk(url: URL,
                                chunk: Chunk,
                                session: URLSession,
                                delegate: ChunkDelegate) async throws -> (Int, URL) {
         var lastError: Error = DownloadError.badResponse
         for attempt in 0..<3 {
             do {
-                var req = URLRequest(url: signedURL)
+                var req = URLRequest(url: url)
                 req.cachePolicy = .reloadIgnoringLocalCacheData
                 req.setValue("bytes=\(chunk.start)-\(chunk.end)", forHTTPHeaderField: "Range")
                 let partURL: URL = try await withCheckedThrowingContinuation { continuation in
@@ -315,7 +327,9 @@ final class DownloadEngine: @unchecked Sendable {
     }
 
     private func makeChunks(total: Int64, connections: Int) -> [Chunk] {
-        let minChunk: Int64 = 2 * 1024 * 1024 // 每段至少 2MB，太碎反而慢
+        // 每段最小 512KB：原来写 2MB 会导致 1~10MB 的产物只开 1~5 个连接，
+        // 等于完全没并发（这是"开了加速还是几百 KB"的主因）
+        let minChunk: Int64 = 512 * 1024
         var count = Int64(max(1, min(connections, 32)))
         if total / count < minChunk {
             count = max(1, total / minChunk)
