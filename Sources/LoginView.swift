@@ -21,7 +21,9 @@ struct LoginView: View {
                     .padding(.vertical, 4)
                 }
 
-                Section("使用 Personal Access Token 登录") {
+                // 注意：SwiftUI 没有「标题 + footer」这种 Section 初始化器，
+                // 带 footer 时必须把标题写成 header 视图
+                Section {
                     SecureField("粘贴 Token（ghp_… 或 github_pat_…）", text: $tokenInput)
                         .textInputAutocapitalization(.never)
                         .autocorrectionDisabled()
@@ -29,6 +31,8 @@ struct LoginView: View {
                          destination: URL(string: "https://github.com/settings/tokens/new?scopes=repo&description=ArtifactBoost")!)
                     Link("② 创建 fine-grained Token（需 Actions 读权限）",
                          destination: URL(string: "https://github.com/settings/personal-access-tokens/new")!)
+                } header: {
+                    Text("使用 Personal Access Token 登录")
                 } footer: {
                     Text("Token 仅保存在本机钥匙串，不会上传到任何第三方服务器。fine-grained Token 请为目标仓库开启 Actions: Read 和 Contents: Read 权限。")
                 }
