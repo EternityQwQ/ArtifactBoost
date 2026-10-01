@@ -11,8 +11,10 @@ struct DownloadRoute: Equatable, Sendable {
 
     /// 内置公共镜像。它们只是中转「已签名的产物地址」，不接触 Token；
     /// 但私有仓库的产物不应经过第三方，所以只在公开仓库且用户开启智能加速时使用。
+    /// 不同节点往往落在不同的机房/线路上，多通道并行时带宽可以叠加。
     static let builtInMirrors: [DownloadRoute] = [
         DownloadRoute(name: "gh-proxy.com", prefix: "https://gh-proxy.com/"),
+        DownloadRoute(name: "slink.ltd", prefix: "https://slink.ltd/"),
         DownloadRoute(name: "hk.gh-proxy.com", prefix: "https://hk.gh-proxy.com/"),
         DownloadRoute(name: "moeyy.xyz", prefix: "https://github.moeyy.xyz/"),
     ]
@@ -21,6 +23,12 @@ struct DownloadRoute: Equatable, Sendable {
         guard !prefix.isEmpty, let mirrored = URL(string: prefix + url.absoluteString) else { return url }
         return mirrored
     }
+}
+
+/// 带实测速度的通道，用于按速度分配分块
+struct ScoredRoute: Equatable, Sendable {
+    let route: DownloadRoute
+    let speed: Double
 }
 
 enum RouteMode: String, CaseIterable, Identifiable {
@@ -53,26 +61,25 @@ enum RouteProbe {
         return URLSession(configuration: config)
     }()
 
-    static func fastest(among routes: [DownloadRoute],
-                        signedURL: URL,
-                        sampleLimit: Int64 = sampleBytes) async -> (route: DownloadRoute, speed: Double)? {
+    /// 并发测量所有通道，返回按速度从快到慢排序的结果（失败的通道会被丢掉）
+    static func measureAll(among routes: [DownloadRoute],
+                           signedURL: URL,
+                           sampleLimit: Int64 = sampleBytes) async -> [ScoredRoute] {
         let limit = max(64 * 1024, min(sampleLimit, sampleBytes))
-        return await withTaskGroup(of: (DownloadRoute, Double)?.self) { group in
+        let results = await withTaskGroup(of: ScoredRoute?.self) { group in
             for route in routes {
                 group.addTask { await measure(route: route, signedURL: signedURL, limit: limit) }
             }
-            var best: (route: DownloadRoute, speed: Double)?
+            var collected: [ScoredRoute] = []
             for await result in group {
-                guard let result else { continue }
-                if best == nil || result.1 > best!.speed {
-                    best = (result.0, result.1)
-                }
+                if let result { collected.append(result) }
             }
-            return best
+            return collected
         }
+        return results.sorted { $0.speed > $1.speed }
     }
 
-    static func measure(route: DownloadRoute, signedURL: URL, limit: Int64 = sampleBytes) async -> (DownloadRoute, Double)? {
+    static func measure(route: DownloadRoute, signedURL: URL, limit: Int64 = sampleBytes) async -> ScoredRoute? {
         var request = URLRequest(url: route.apply(to: signedURL))
         request.cachePolicy = .reloadIgnoringLocalCacheData
         request.timeoutInterval = timeout
@@ -85,6 +92,6 @@ enum RouteProbe {
               http.statusCode == 206,
               !data.isEmpty else { return nil }
         let elapsed = max(Date().timeIntervalSince(start), 0.05)
-        return (route, Double(data.count) / elapsed)
+        return ScoredRoute(route: route, speed: Double(data.count) / elapsed)
     }
 }

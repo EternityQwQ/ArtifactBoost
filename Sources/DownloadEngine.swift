@@ -200,13 +200,16 @@ final class DownloadEngine: @unchecked Sendable {
         lock.unlock()
     }
 
+    /// 多通道并行：把分块按实测速度分配给多条通道同时下载，带宽可以叠加；
+    /// routes 需按速度从快到慢排列，第一条同时作为其它通道失败时的兜底
     func download(signedURL: URL,
-                  route: DownloadRoute,
+                  routes: [ScoredRoute],
                   fileName: String,
                   connections: Int,
                   progress: @escaping @Sendable (DownloadProgress) -> Void) async throws -> DownloadResult {
         let startedAt = Date()
-        let requestURL = route.apply(to: signedURL)
+        let plan = routes.isEmpty ? [ScoredRoute(route: .direct, speed: 1)] : routes
+        let urls = plan.map { $0.route.apply(to: signedURL) }
         let fm = FileManager.default
         let tempDir = fm.temporaryDirectory.appendingPathComponent("ab-\(UUID().uuidString)", isDirectory: true)
         try fm.createDirectory(at: tempDir, withIntermediateDirectories: true)
@@ -220,12 +223,12 @@ final class DownloadEngine: @unchecked Sendable {
             outURL = outDir.appendingPathComponent("\(UUID().uuidString.prefix(6))-\(fileName)")
         }
 
-        let total = try await probeSize(url: requestURL)
+        let total = try await probeSize(urls: urls)
         let accumulator = ProgressAccumulator(total: total ?? 0, handler: progress)
 
         // 服务器不支持分块（或探测不到体积）时，退化为单连接下载
         guard let total, total > 0 else {
-            let (tmp, resp) = try await URLSession.shared.download(from: requestURL)
+            let (tmp, resp) = try await URLSession.shared.download(from: urls[0])
             guard let http = resp as? HTTPURLResponse, (200..<300).contains(http.statusCode) else {
                 throw DownloadError.badResponse
             }
@@ -249,11 +252,18 @@ final class DownloadEngine: @unchecked Sendable {
         }
 
         let chunks = makeChunks(total: total, connections: connections)
+        let assignment = Self.assign(chunks: chunks, speeds: plan.map(\.speed))
+        let fallbackURL = urls[0]
         var parts: [(Int, URL)] = []
         try await withThrowingTaskGroup(of: (Int, URL).self) { group in
-            for chunk in chunks {
+            for (index, chunk) in chunks.enumerated() {
+                let url = urls[min(assignment[index], urls.count - 1)]
                 group.addTask {
-                    try await self.downloadChunk(url: requestURL, chunk: chunk, session: session, delegate: delegate)
+                    try await self.downloadChunk(url: url,
+                                                 fallbackURL: url == fallbackURL ? nil : fallbackURL,
+                                                 chunk: chunk,
+                                                 session: session,
+                                                 delegate: delegate)
                 }
             }
             for try await part in group {
@@ -298,10 +308,47 @@ final class DownloadEngine: @unchecked Sendable {
         }
     }
 
+    /// 按实测速度分配分块：谁快谁多分，避免慢通道拖住整体进度
+    private static func assign(chunks: [Chunk], speeds: [Double]) -> [Int] {
+        guard speeds.count > 1 else { return Array(repeating: 0, count: chunks.count) }
+        var load = [Double](repeating: 0, count: speeds.count)
+        var assignment: [Int] = []
+        assignment.reserveCapacity(chunks.count)
+        for chunk in chunks {
+            var target = 0
+            var bestScore = Double.greatestFiniteMagnitude
+            for index in speeds.indices {
+                let score = load[index] / max(speeds[index], 0.01)
+                if score < bestScore {
+                    bestScore = score
+                    target = index
+                }
+            }
+            load[target] += Double(chunk.length)
+            assignment.append(target)
+        }
+        return assignment
+    }
+
     private func downloadChunk(url: URL,
+                               fallbackURL: URL?,
                                chunk: Chunk,
                                session: URLSession,
                                delegate: ChunkDelegate) async throws -> (Int, URL) {
+        do {
+            return try await attemptChunk(url: url, chunk: chunk, session: session, delegate: delegate)
+        } catch {
+            if Self.isCancellation(error) { throw DownloadError.cancelled }
+            // 该通道彻底失败（镜像挂了/被限流），换主通道再试一次
+            guard let fallbackURL else { throw error }
+            return try await attemptChunk(url: fallbackURL, chunk: chunk, session: session, delegate: delegate)
+        }
+    }
+
+    private func attemptChunk(url: URL,
+                              chunk: Chunk,
+                              session: URLSession,
+                              delegate: ChunkDelegate) async throws -> (Int, URL) {
         var lastError: Error = DownloadError.badResponse
         for attempt in 0..<3 {
             do {
@@ -347,6 +394,16 @@ final class DownloadEngine: @unchecked Sendable {
 
     /// 探测文件大小：优先用 `Range: bytes=0-0`（返回 206 才能确认服务器支持分段下载），
     /// 失败再退回 HEAD。返回 nil 表示不能分段，调用方会退化为单连接下载。
+    /// 逐条通道尝试，任何一条成功即可。
+    private func probeSize(urls: [URL]) async throws -> Int64? {
+        for url in urls {
+            if let total = try await probeSize(url: url), total > 0 {
+                return total
+            }
+        }
+        return nil
+    }
+
     private func probeSize(url: URL) async throws -> Int64? {
         var range = URLRequest(url: url)
         range.cachePolicy = .reloadIgnoringLocalCacheData
