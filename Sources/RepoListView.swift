@@ -14,75 +14,60 @@ struct RepoListView: View {
     }
 
     var body: some View {
-        NavigationStack {
-            List {
-                if let errorMessage {
-                    Section {
-                        Text(errorMessage).foregroundStyle(.red)
-                    }
-                }
+        List {
+            if let errorMessage {
+                Section { ErrorBanner(text: errorMessage) }
+            }
 
+            if shownRepos.isEmpty && !isLoading && !isSearchingRemote {
+                EmptyStateView(systemName: "shippingbox",
+                               title: searchText.isEmpty ? "还没有仓库" : "本地没有匹配的仓库",
+                               message: searchText.isEmpty
+                                   ? "下拉刷新试试，或在搜索框输入关键词后回车远程搜索"
+                                   : "在搜索框回车可直接到 GitHub 上远程搜索")
+            }
+
+            if !shownRepos.isEmpty {
                 Section {
                     ForEach(shownRepos) { repo in
                         NavigationLink(value: repo) {
-                            VStack(alignment: .leading, spacing: 4) {
-                                HStack(spacing: 6) {
-                                    if repo.isPrivate {
-                                        Image(systemName: "lock.fill")
-                                            .font(.caption)
-                                            .foregroundStyle(.secondary)
-                                    }
-                                    Text(repo.fullName).font(.headline)
-                                }
-                                if let date = repo.updatedAt {
-                                    Text("更新于 \(date.formatted(date: .numeric, time: .shortened))")
-                                        .font(.caption)
-                                        .foregroundStyle(.secondary)
-                                }
-                            }
+                            RepoRow(repo: repo)
                         }
                     }
+                } header: {
+                    HStack {
+                        Text("共 \(shownRepos.count) 个仓库")
+                        Spacer()
+                        if isSearchingRemote { ProgressView().controlSize(.mini) }
+                    }
                 }
+            }
 
-                if isLoading || isSearchingRemote {
-                    Section {
-                        HStack {
-                            Spacer()
-                            ProgressView()
-                            Spacer()
-                        }
+            if isLoading {
+                Section {
+                    HStack {
+                        Spacer()
+                        ProgressView()
+                        Spacer()
                     }
                 }
             }
-            .navigationTitle("我的仓库")
-            .searchable(text: $searchText, prompt: "输入关键词，回车远程搜索")
-            .onSubmit(of: .search) {
-                if searchText.trimmingCharacters(in: .whitespaces).isEmpty {
-                    Task { await loadRepos() }
-                } else {
-                    Task { await remoteSearch() }
-                }
-            }
-            .navigationDestination(for: GHRepo.self) { repo in
-                RunListView(repo: repo)
-            }
-            .toolbar {
-                ToolbarItem(placement: .navigationBarTrailing) {
-                    Menu {
-                        if let login = session.user?.login {
-                            Text("已登录：\(login)")
-                        }
-                        Button("退出登录", role: .destructive) {
-                            session.logout()
-                        }
-                    } label: {
-                        Image(systemName: "person.crop.circle")
-                    }
-                }
-            }
-            .task { await loadRepos() }
-            .refreshable { await loadRepos() }
         }
+        .listStyle(.insetGrouped)
+        .navigationTitle("我的仓库")
+        .searchable(text: $searchText, prompt: "筛选仓库，回车远程搜索")
+        .onSubmit(of: .search) {
+            if searchText.trimmingCharacters(in: .whitespaces).isEmpty {
+                Task { await loadRepos() }
+            } else {
+                Task { await remoteSearch() }
+            }
+        }
+        .navigationDestination(for: GHRepo.self) { repo in
+            RepoDetailView(repo: repo)
+        }
+        .task { await loadRepos() }
+        .refreshable { await loadRepos() }
     }
 
     private func loadRepos() async {
@@ -113,5 +98,46 @@ struct RepoListView: View {
         } catch {
             errorMessage = session.message(for: error)
         }
+    }
+}
+
+private struct RepoRow: View {
+    let repo: GHRepo
+
+    var body: some View {
+        HStack(spacing: 12) {
+            IconBadge(systemName: repo.isPrivate ? "lock.fill" : "book.closed.fill",
+                      color: repo.isPrivate ? Theme.orange : Theme.accent)
+
+            VStack(alignment: .leading, spacing: 3) {
+                Text(repo.name)
+                    .font(.subheadline.weight(.semibold))
+                    .lineLimit(1)
+                HStack(spacing: 8) {
+                    if let owner = repo.fullName.split(separator: "/").first {
+                        Text(String(owner))
+                    }
+                    if let language = repo.language {
+                        Text("·")
+                        Text(language)
+                    }
+                    if let stars = repo.stargazersCount, stars > 0 {
+                        Text("·")
+                        Label("\(stars)", systemImage: "star.fill")
+                            .labelStyle(.titleAndIcon)
+                    }
+                }
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+                .lineLimit(1)
+
+                if let date = repo.updatedAt {
+                    Text("更新于 \(date.formatted(date: .numeric, time: .shortened))")
+                        .font(.caption2)
+                        .foregroundStyle(.tertiary)
+                }
+            }
+        }
+        .padding(.vertical, 2)
     }
 }

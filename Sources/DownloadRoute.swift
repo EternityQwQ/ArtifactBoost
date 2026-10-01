@@ -1,7 +1,7 @@
 import Foundation
 
 /// 下载通道：直连 Azure 签名地址，或经由镜像 / 自建反代中转（前缀 + 原始地址）
-struct DownloadRoute: Equatable, Sendable {
+struct DownloadRoute: Hashable, Sendable {
     let name: String
     let prefix: String
 
@@ -22,6 +22,14 @@ struct DownloadRoute: Equatable, Sendable {
     func apply(to url: URL) -> URL {
         guard !prefix.isEmpty, let mirrored = URL(string: prefix + url.absoluteString) else { return url }
         return mirrored
+    }
+
+    /// 补全并校验用户填的前缀，非法时返回空串
+    static func normalizedPrefix(_ raw: String) -> String {
+        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return "" }
+        guard let url = URL(string: trimmed), url.scheme != nil else { return "" }
+        return trimmed.hasSuffix("/") ? trimmed : trimmed + "/"
     }
 }
 
@@ -45,19 +53,117 @@ enum RouteMode: String, CaseIterable, Identifiable {
         case .custom: return "自定义"
         }
     }
+
+    var detail: String {
+        switch self {
+        case .direct: return "直接连 GitHub 存储，最安全，但国内通常很慢"
+        case .smart: return "自动在直连与公共镜像之间测速，选最快的通道"
+        case .custom: return "使用你自己搭建的中转（Cloudflare Worker / 反向代理）"
+        }
+    }
+}
+
+/// 持久化的加速设置：在「设置」页调好并保存，下载时直接套用
+struct AccelerationSettings {
+    var connections: Int = 16
+    var mode: RouteMode = .smart
+    var customPrefix: String = ""
+    /// 「设置」页测速得到的最快通道
+    var testedRoute: DownloadRoute?
+    var testedSpeed: Double = 0
+    var testedAt: Date?
+
+    static let `default` = AccelerationSettings()
+    static let connectionOptions = [8, 16, 32, 64]
+
+    private enum Keys {
+        static let connections = "ab.connections"
+        static let mode = "ab.routeMode"
+        static let customPrefix = "ab.customPrefix"
+        static let testedName = "ab.testedRouteName"
+        static let testedPrefix = "ab.testedRoutePrefix"
+        static let testedSpeed = "ab.testedRouteSpeed"
+        static let testedAt = "ab.testedRouteDate"
+    }
+
+    static func load() -> AccelerationSettings {
+        let store = UserDefaults.standard
+        var settings = AccelerationSettings()
+        let stored = store.integer(forKey: Keys.connections)
+        settings.connections = stored > 0 ? stored : 16
+        settings.mode = RouteMode(rawValue: store.string(forKey: Keys.mode) ?? "") ?? .smart
+        settings.customPrefix = store.string(forKey: Keys.customPrefix) ?? ""
+        if let name = store.string(forKey: Keys.testedName) {
+            settings.testedRoute = DownloadRoute(name: name, prefix: store.string(forKey: Keys.testedPrefix) ?? "")
+            settings.testedSpeed = store.double(forKey: Keys.testedSpeed)
+            settings.testedAt = store.object(forKey: Keys.testedAt) as? Date
+        }
+        return settings
+    }
+
+    func save() {
+        let store = UserDefaults.standard
+        store.set(clampedConnections, forKey: Keys.connections)
+        store.set(mode.rawValue, forKey: Keys.mode)
+        store.set(customPrefix, forKey: Keys.customPrefix)
+        if let route = testedRoute {
+            store.set(route.name, forKey: Keys.testedName)
+            store.set(route.prefix, forKey: Keys.testedPrefix)
+            store.set(testedSpeed, forKey: Keys.testedSpeed)
+            store.set(testedAt ?? Date(), forKey: Keys.testedAt)
+        } else {
+            for key in [Keys.testedName, Keys.testedPrefix, Keys.testedSpeed, Keys.testedAt] {
+                store.removeObject(forKey: key)
+            }
+        }
+    }
+
+    var clampedConnections: Int { max(1, min(connections, 64)) }
+
+    /// 当前设置下的候选通道（直连永远保留兜底）
+    func candidateRoutes(isPrivateRepo: Bool = false) -> [DownloadRoute] {
+        switch mode {
+        case .direct:
+            return [.direct]
+        case .custom:
+            let prefix = DownloadRoute.normalizedPrefix(customPrefix)
+            guard !prefix.isEmpty else { return [.direct] }
+            return [DownloadRoute(name: "自定义加速", prefix: prefix), .direct]
+        case .smart:
+            guard !isPrivateRepo else { return [.direct] }
+            return [.direct] + DownloadRoute.builtInMirrors
+        }
+    }
+
+    /// 可以直接沿用的测速结果（24 小时内有效、且不在私有仓库里用镜像）
+    func savedPlan(isPrivateRepo: Bool) -> [ScoredRoute]? {
+        guard let route = testedRoute, let testedAt else { return nil }
+        guard Date().timeIntervalSince(testedAt) < 24 * 3600 else { return nil }
+        guard !(isPrivateRepo && !route.isDirect) else { return nil }
+        guard candidateRoutes(isPrivateRepo: isPrivateRepo).contains(route) else { return nil }
+        return [ScoredRoute(route: route, speed: max(testedSpeed, 0.01))]
+    }
+
+    /// 记录一次测速结果
+    mutating func record(route: DownloadRoute, speed: Double) {
+        testedRoute = route
+        testedSpeed = speed
+        testedAt = Date()
+        save()
+    }
 }
 
 /// 通道测速：每个通道各拉一小段数据，取最快的那条
 enum RouteProbe {
-    /// 采样 512KB：快通道 0.1~0.5s 出结果，慢通道也不会拖太久
-    static let sampleBytes: Int64 = 512 * 1024
+    /// 采样 256KB：快通道 0.1~0.5s 出结果，慢通道也不会拖太久
+    static let sampleBytes: Int64 = 256 * 1024
     static let timeout: TimeInterval = 6
 
     /// 探测专用会话：限制总时长，防止某个通道不认 Range 时把整个文件都拉进内存
     private static let session: URLSession = {
         let config = URLSessionConfiguration.ephemeral
         config.timeoutIntervalForRequest = timeout
-        config.timeoutIntervalForResource = 20
+        config.timeoutIntervalForResource = 10
         return URLSession(configuration: config)
     }()
 
@@ -88,8 +194,8 @@ enum RouteProbe {
         let start = Date()
         guard let (data, response) = try? await session.data(for: request),
               let http = response as? HTTPURLResponse,
-              // 必须是 206：既确认这条通道支持分段，也避免拿到 200 时把整个文件读进内存
-              http.statusCode == 206,
+              // 206 = 支持分段；200 说明目标本身小于采样长度（比如日志包），按实际收到的字节算速度
+              http.statusCode == 206 || http.statusCode == 200,
               !data.isEmpty else { return nil }
         let elapsed = max(Date().timeIntervalSince(start), 0.05)
         return ScoredRoute(route: route, speed: Double(data.count) / elapsed)

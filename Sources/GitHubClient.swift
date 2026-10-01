@@ -108,13 +108,50 @@ final class GitHubClient {
         return resp.artifacts
     }
 
-    /// 请求产物下载接口：GitHub 会 302 跳转到带签名的真实地址（Azure Blob），
-    /// 这里拦截跳转拿到签名地址，后续分段下载直接打这个地址（不需要再带 Token）
-    func resolveDownloadURL(repo: GHRepo, artifact: GHArtifact) async throws -> URL {
-        let url = try makeURL("repos/\(repo.fullName)/actions/artifacts/\(artifact.id)/zip")
+    /// 某个仓库的正式版（Release）
+    func releases(repo: GHRepo) async throws -> [GHRelease] {
+        try await get("repos/\(repo.fullName)/releases", query: [
+            URLQueryItem(name: "per_page", value: "50"),
+        ])
+    }
+
+    /// 仓库分支（用于下载任意分支的源码包）
+    func branches(repo: GHRepo) async throws -> [GHBranch] {
+        try await get("repos/\(repo.fullName)/branches", query: [
+            URLQueryItem(name: "per_page", value: "100"),
+        ])
+    }
+
+    /// 解析任意下载项的签名地址。
+    /// GitHub 对这些接口都会 302 跳转到带签名的真实地址（产物/日志在 Azure Blob，
+    /// 源码包在 codeload），这里拦下跳转拿到真实地址，后续分段下载直接打这个地址
+    /// （不再需要 Token，也不再经过 api.github.com）。
+    func resolveDownloadURL(for source: DownloadSource) async throws -> URL {
+        var extraHeaders: [String: String] = [:]
+        let path: String
+        switch source {
+        case .artifact(let repo, let id):
+            path = "repos/\(repo)/actions/artifacts/\(id)/zip"
+        case .runLogs(let repo, let runID):
+            path = "repos/\(repo)/actions/runs/\(runID)/logs"
+        case .releaseAsset(let repo, let assetID):
+            path = "repos/\(repo)/releases/assets/\(assetID)"
+            // 附件接口默认返回 JSON 元数据，必须显式要二进制才会 302
+            extraHeaders["Accept"] = "application/octet-stream"
+        case .sourceArchive(let repo, let ref, let format):
+            let encoded = ref.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? ref
+            path = encoded.isEmpty ? "repos/\(repo)/\(format.path)" : "repos/\(repo)/\(format.path)/\(encoded)"
+        }
+
+        let url = try makeURL(path)
+        var request = authorizedRequest(url)
+        for (key, value) in extraHeaders {
+            request.setValue(value, forHTTPHeaderField: key)
+        }
+
         let session = URLSession(configuration: .ephemeral, delegate: RedirectCatcher(), delegateQueue: nil)
         defer { session.invalidateAndCancel() }
-        let (_, resp) = try await session.data(for: authorizedRequest(url))
+        let (data, resp) = try await session.data(for: request)
         guard let http = resp as? HTTPURLResponse else { throw GitHubError.badResponse }
         if http.statusCode == 410 { throw GitHubError.artifactExpired }
         if http.statusCode == 302 || http.statusCode == 303,
@@ -123,7 +160,8 @@ final class GitHubClient {
             return signed
         }
         if !(200..<300).contains(http.statusCode) {
-            throw GitHubError.http(http.statusCode, "")
+            let message = (try? JSONDecoder().decode(GHErrorMessage.self, from: data))?.message ?? ""
+            throw GitHubError.http(http.statusCode, message)
         }
         throw GitHubError.downloadURLNotFound
     }
