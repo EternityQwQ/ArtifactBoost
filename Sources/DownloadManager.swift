@@ -26,8 +26,8 @@ final class DownloadManager: ObservableObject {
 
     private var engines: [Int64: DownloadEngine] = [:]
     private var backgroundTasks: [Int64: UIBackgroundTaskIdentifier] = [:]
-    /// 本次运行内测速选出的最快通道，后续下载直接复用，不必每次等测速
-    private static var cachedRoute: DownloadRoute?
+    /// 本次运行内测速选出的通道组合（含实测速度），后续下载直接复用，不必每次等测速
+    private static var cachedPlan: [ScoredRoute]?
     let client: GitHubClient
 
     init(client: GitHubClient) {
@@ -132,50 +132,65 @@ final class DownloadManager: ObservableObject {
         let artifactID = artifact.id
         let candidates = Self.candidateRoutes(settings: settings, isPrivateRepo: isPrivateRepo)
 
-        var route = candidates[0]
-        var note = route.name
+        var plan: [ScoredRoute]
+        var note: String
         if candidates.count > 1 {
-            if let cached = Self.cachedRoute, candidates.contains(cached) {
+            if let cached = Self.cachedPlan {
                 // 同一台手机的网络环境短时间内不会变，测速过一次就复用，避免每次都等测速
-                route = cached
-                note = "\(route.name)（沿用已测速结果）"
+                plan = cached
+                note = Self.describe(plan).appending("（沿用已测速结果）")
             } else {
                 routeSummary[artifactID] = "正在测速选通道…"
-                if let best = await RouteProbe.fastest(among: candidates,
-                                                       signedURL: signedURL,
-                                                       sampleLimit: artifact.sizeInBytes) {
-                    route = best.route
-                    Self.cachedRoute = best.route
-                    note = "\(route.name)（实测 \(formatSpeed(best.speed))）"
-                } else {
-                    route = .direct
+                let measured = await RouteProbe.measureAll(among: candidates,
+                                                           signedURL: signedURL,
+                                                           sampleLimit: artifact.sizeInBytes)
+                // 慢得多的通道不参与并行，否则它那块会拖住整个下载
+                let fastest = measured.first?.speed ?? 0
+                let viable = measured.filter { $0.speed >= fastest * 0.4 }
+                if viable.isEmpty {
+                    plan = [ScoredRoute(route: .direct, speed: 1)]
                     note = "直连（测速失败）"
+                } else {
+                    plan = viable
+                    Self.cachedPlan = plan
+                    note = Self.describe(plan).appending("（实测 \(formatSpeed(fastest))）")
                 }
             }
         } else if isPrivateRepo, settings.mode == .smart {
+            plan = [ScoredRoute(route: .direct, speed: 1)]
             note = "直连（私有仓库不走镜像）"
+        } else {
+            plan = [ScoredRoute(route: candidates[0], speed: 1)]
+            note = candidates[0].isDirect ? "直连" : candidates[0].name
         }
 
+        let connections = max(1, min(settings.connections, 64))
         do {
             let result = try await engine.download(signedURL: signedURL,
-                                                   route: route,
+                                                   routes: plan,
                                                    fileName: fileName,
-                                                   connections: max(1, min(settings.connections, 32)),
+                                                   connections: connections,
                                                    progress: onProgress)
             routeSummary[artifactID] = "\(note) · 平均 \(formatSpeed(result.averageSpeed))"
             return result.fileURL
         } catch {
-            // 镜像可能失效/被限流，回退直连再试一次，并清掉测速缓存
-            guard Self.shouldRetry(error), !route.isDirect else { throw error }
-            Self.cachedRoute = nil
+            // 通道可能失效/被限流，清掉缓存后整体回退直连再试一次
+            guard Self.shouldRetry(error), plan.contains(where: { !$0.route.isDirect }) else { throw error }
+            Self.cachedPlan = nil
             let result = try await engine.download(signedURL: signedURL,
-                                                   route: .direct,
+                                                   routes: [ScoredRoute(route: .direct, speed: 1)],
                                                    fileName: fileName,
-                                                   connections: max(1, min(settings.connections, 32)),
+                                                   connections: connections,
                                                    progress: onProgress)
-            routeSummary[artifactID] = "直连（\(route.name) 失败已回退） · 平均 \(formatSpeed(result.averageSpeed))"
+            routeSummary[artifactID] = "直连（\(note) 失败已回退） · 平均 \(formatSpeed(result.averageSpeed))"
             return result.fileURL
         }
+    }
+
+    /// 通道描述，例如「多通道 gh-proxy.com + slink.ltd」
+    private static func describe(_ plan: [ScoredRoute]) -> String {
+        let names = plan.map { $0.route.isDirect ? "直连" : $0.route.name }
+        return plan.count > 1 ? "多通道 " + names.joined(separator: " + ") : names[0]
     }
 
     /// 候选通道：直连永远保留兜底

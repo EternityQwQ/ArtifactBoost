@@ -27,7 +27,7 @@ struct ArtifactListView: View {
     var body: some View {
         List {
             Section {
-                Stepper("并发连接数：\(connections)", value: $connections, in: 1...32)
+                Stepper("并发连接数：\(connections)", value: $connections, in: 1...64)
                 Picker("下载通道", selection: $routeMode) {
                     ForEach(RouteMode.allCases) { mode in
                         Text(mode.title).tag(mode)
@@ -43,7 +43,7 @@ struct ArtifactListView: View {
             } header: {
                 Text("加速设置")
             } footer: {
-                Text("并发数默认 16：产物只有几 MB 时也能把连接开满。\n「智能加速」会先给直连和公共镜像测速，自动选最快的一条；镜像只中转已签名的产物地址、不接触你的 Token，但私有仓库请保持「直连」。")
+                Text("并发数默认 16：产物只有几 MB 时也能把连接开满，带宽充足时可拉到 32~64。\n「智能加速」会先给直连和公共镜像测速，把可用的通道**同时**用于下载，带宽可以叠加。镜像只中转已签名的产物地址、不接触你的 Token，但私有仓库请保持「直连」。")
             }
 
             if let errorMessage {
