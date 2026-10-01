@@ -7,14 +7,16 @@ struct DownloadProgress: Equatable {
     var speedBytesPerSecond: Double = 0
 }
 
-enum DownloadError: LocalizedError {
+enum DownloadError: LocalizedError, Equatable {
     case badResponse
     case cancelled
+    case incomplete
 
     var errorDescription: String? {
         switch self {
         case .badResponse: return "下载失败：服务器响应异常"
         case .cancelled: return "下载已取消"
+        case .incomplete: return "下载失败：数据校验不通过（可能断流），请重试"
         }
     }
 }
@@ -23,48 +25,56 @@ private struct Chunk {
     let index: Int
     let start: Int64
     let end: Int64
+    var length: Int64 { end - start + 1 }
 }
 
 /// 汇总各分块进度，节流后回调给 UI
 private actor ProgressAccumulator {
     private var chunkBytes: [Int: Int64] = [:]
     private let total: Int64
-    private let startTime = Date()
-    private var lastEmit = Date.distantPast
     private let handler: @Sendable (DownloadProgress) -> Void
+    private var lastEmit = Date.distantPast
+    private var lastSampleTime = Date()
+    private var lastSampleBytes: Int64 = 0
+    private var smoothedSpeed: Double = 0
 
     init(total: Int64, handler: @escaping @Sendable (DownloadProgress) -> Void) {
         self.total = total
         self.handler = handler
     }
 
-    private func emit(force: Bool = false) {
+    /// 速度用滑动平均，避免瞬时抖动导致数字乱跳
+    private func snapshot(downloaded: Int64) -> DownloadProgress {
         let now = Date()
-        if !force, now.timeIntervalSince(lastEmit) < 0.25 { return }
-        lastEmit = now
-        let downloaded = chunkBytes.values.reduce(0, +)
-        let elapsed = max(now.timeIntervalSince(startTime), 0.05)
-        handler(DownloadProgress(
+        let dt = now.timeIntervalSince(lastSampleTime)
+        if dt > 0.05 {
+            let instant = Double(downloaded - lastSampleBytes) / dt
+            smoothedSpeed = smoothedSpeed <= 0 ? instant : smoothedSpeed * 0.6 + instant * 0.4
+            lastSampleTime = now
+            lastSampleBytes = downloaded
+        }
+        return DownloadProgress(
             downloadedBytes: downloaded,
             totalBytes: total,
             fraction: total > 0 ? min(Double(downloaded) / Double(total), 1) : 0,
-            speedBytesPerSecond: Double(downloaded) / elapsed
-        ))
+            speedBytesPerSecond: max(smoothedSpeed, 0)
+        )
     }
 
     func update(chunk: Int, bytes: Int64) {
         chunkBytes[chunk] = bytes
-        emit()
+        let now = Date()
+        guard now.timeIntervalSince(lastEmit) >= 0.25 else { return }
+        lastEmit = now
+        handler(snapshot(downloaded: chunkBytes.values.reduce(0, +)))
     }
 
     func finish(downloaded: Int64) {
-        let elapsed = max(Date().timeIntervalSince(startTime), 0.05)
-        handler(DownloadProgress(
-            downloadedBytes: downloaded,
-            totalBytes: total > 0 ? total : downloaded,
-            fraction: 1,
-            speedBytesPerSecond: Double(downloaded) / elapsed
-        ))
+        var progress = snapshot(downloaded: downloaded)
+        progress.totalBytes = max(total, downloaded)
+        progress.downloadedBytes = progress.totalBytes
+        progress.fraction = 1
+        handler(progress)
     }
 }
 
@@ -72,6 +82,7 @@ private actor ProgressAccumulator {
 private final class ChunkDelegate: NSObject, URLSessionDownloadDelegate, @unchecked Sendable {
     private let lock = NSLock()
     private var chunkForTask: [Int: Int] = [:]
+    private var expectedLengths: [Int: Int64] = [:]
     private var continuations: [Int: CheckedContinuation<URL, Error>] = [:]
     private var partURLs: [Int: URL] = [:]
     private var taskErrors: [Int: Error] = [:]
@@ -83,9 +94,10 @@ private final class ChunkDelegate: NSObject, URLSessionDownloadDelegate, @unchec
         self.tempDir = tempDir
     }
 
-    func register(task: URLSessionDownloadTask, chunk: Int, continuation: CheckedContinuation<URL, Error>) {
+    func register(task: URLSessionDownloadTask, chunk: Chunk, continuation: CheckedContinuation<URL, Error>) {
         lock.lock()
-        chunkForTask[task.taskIdentifier] = chunk
+        chunkForTask[task.taskIdentifier] = chunk.index
+        expectedLengths[chunk.index] = chunk.length
         continuations[task.taskIdentifier] = continuation
         lock.unlock()
     }
@@ -129,28 +141,44 @@ private final class ChunkDelegate: NSObject, URLSessionDownloadDelegate, @unchec
         }
         let part = partURLs.removeValue(forKey: id)
         let storedError = taskErrors.removeValue(forKey: id)
+        let chunkIndex = chunkForTask.removeValue(forKey: id)
+        let expected = chunkIndex.flatMap { expectedLengths.removeValue(forKey: $0) }
         let response = task.response as? HTTPURLResponse
         lock.unlock()
 
         if let error {
             continuation.resume(throwing: error)
-        } else if let storedError {
-            continuation.resume(throwing: storedError)
-        } else if let response, !(200..<300).contains(response.statusCode) {
-            continuation.resume(throwing: DownloadError.badResponse)
-        } else if let part {
-            continuation.resume(returning: part)
-        } else {
-            continuation.resume(throwing: DownloadError.badResponse)
+            return
         }
+        if let storedError {
+            continuation.resume(throwing: storedError)
+            return
+        }
+        guard let response, response.statusCode == 200 || response.statusCode == 206 else {
+            continuation.resume(throwing: DownloadError.badResponse)
+            return
+        }
+        guard let part, let expected else {
+            continuation.resume(throwing: DownloadError.badResponse)
+            return
+        }
+        // 关键校验：服务器忽略 Range（返回 200 全量）或连接被截断时，
+        // 分块体积会对不上，必须在这里拦下来，否则会合并出一个损坏的压缩包
+        let actual = ((try? FileManager.default.attributesOfItem(atPath: part.path))?[.size] as? Int64) ?? 0
+        guard actual == expected else {
+            try? FileManager.default.removeItem(at: part)
+            continuation.resume(throwing: DownloadError.incomplete)
+            return
+        }
+        continuation.resume(returning: part)
     }
 }
 
 /// 多线程分段下载引擎：
-/// 先用 HEAD/Range 探测文件大小，然后切成 N 段并发下载，最后按序合并。
+/// 先用 Range 探测文件大小并确认服务器支持分段，然后切成 N 段并发下载，最后按序合并。
 /// 产物实际托管在 Azure Blob Storage，支持 Range 请求；
 /// 单连接被限速时，多并发能显著提升总速度。
-final class DownloadEngine {
+final class DownloadEngine: @unchecked Sendable {
     private let lock = NSLock()
     private var session: URLSession?
 
@@ -174,9 +202,7 @@ final class DownloadEngine {
         let fm = FileManager.default
         let tempDir = fm.temporaryDirectory.appendingPathComponent("ab-\(UUID().uuidString)", isDirectory: true)
         try fm.createDirectory(at: tempDir, withIntermediateDirectories: true)
-
-        let total = try await probeSize(url: signedURL)
-        let accumulator = ProgressAccumulator(total: total ?? 0, handler: progress)
+        defer { try? fm.removeItem(at: tempDir) }
 
         let outDir = fm.urls(for: .documentDirectory, in: .userDomainMask)[0]
             .appendingPathComponent("Artifacts", isDirectory: true)
@@ -186,16 +212,19 @@ final class DownloadEngine {
             outURL = outDir.appendingPathComponent("\(UUID().uuidString.prefix(6))-\(fileName)")
         }
 
-        // 服务器不支持分块时，退化为单线程下载
+        let total = try await probeSize(url: signedURL)
+        let accumulator = ProgressAccumulator(total: total ?? 0, handler: progress)
+
+        // 服务器不支持分块（或探测不到体积）时，退化为单连接下载
         guard let total, total > 0 else {
             let (tmp, resp) = try await URLSession.shared.download(from: signedURL)
             guard let http = resp as? HTTPURLResponse, (200..<300).contains(http.statusCode) else {
                 throw DownloadError.badResponse
             }
+            try? fm.removeItem(at: outURL)
             try fm.moveItem(at: tmp, to: outURL)
             let size = ((try? fm.attributesOfItem(atPath: outURL.path))?[.size] as? Int64) ?? 0
             await accumulator.finish(downloaded: size)
-            try? fm.removeItem(at: tempDir)
             return outURL
         }
 
@@ -209,7 +238,6 @@ final class DownloadEngine {
         defer {
             session.invalidateAndCancel()
             setSession(nil)
-            try? fm.removeItem(at: tempDir)
         }
 
         let chunks = makeChunks(total: total, connections: connections)
@@ -225,20 +253,37 @@ final class DownloadEngine {
             }
         }
 
-        // 按顺序合并所有分块
-        fm.createFile(atPath: outURL.path, contents: nil)
+        try merge(parts: parts, into: outURL, total: total)
+        await accumulator.finish(downloaded: total)
+        return outURL
+    }
+
+    /// 按分块顺序合并，并校验最终体积，任何异常都会删掉半成品
+    private func merge(parts: [(Int, URL)], into outURL: URL, total: Int64) throws {
+        let fm = FileManager.default
+        try? fm.removeItem(at: outURL)
+        guard fm.createFile(atPath: outURL.path, contents: nil) else { throw DownloadError.badResponse }
         let out = try FileHandle(forWritingTo: outURL)
-        for (_, partURL) in parts.sorted(by: { $0.0 < $1.0 }) {
-            let input = try FileHandle(forReadingFrom: partURL)
-            while let data = try input.read(upToCount: 1 << 20), !data.isEmpty {
-                try out.write(contentsOf: data)
+        do {
+            for (_, partURL) in parts.sorted(by: { $0.0 < $1.0 }) {
+                let input = try FileHandle(forReadingFrom: partURL)
+                while let data = try input.read(upToCount: 1 << 20), !data.isEmpty {
+                    try out.write(contentsOf: data)
+                }
+                try? input.close()
             }
-            try? input.close()
+        } catch {
+            try? out.close()
+            try? fm.removeItem(at: outURL)
+            throw error
         }
         try? out.close()
 
-        await accumulator.finish(downloaded: total)
-        return outURL
+        let written = ((try? fm.attributesOfItem(atPath: outURL.path))?[.size] as? Int64) ?? 0
+        guard written == total else {
+            try? fm.removeItem(at: outURL)
+            throw DownloadError.incomplete
+        }
     }
 
     private func downloadChunk(signedURL: URL,
@@ -253,15 +298,16 @@ final class DownloadEngine {
                 req.setValue("bytes=\(chunk.start)-\(chunk.end)", forHTTPHeaderField: "Range")
                 let partURL: URL = try await withCheckedThrowingContinuation { continuation in
                     let task = session.downloadTask(with: req)
-                    delegate.register(task: task, chunk: chunk.index, continuation: continuation)
+                    delegate.register(task: task, chunk: chunk, continuation: continuation)
                     task.resume()
                 }
                 return (chunk.index, partURL)
             } catch {
-                if (error as NSError).code == NSURLErrorCancelled { throw DownloadError.cancelled }
+                if Self.isCancellation(error) { throw DownloadError.cancelled }
                 lastError = error
                 if attempt < 2 {
-                    try? await Task.sleep(nanoseconds: UInt64(attempt + 1) * 800_000_000)
+                    if Task.isCancelled { throw DownloadError.cancelled }
+                    try? await Task.sleep(for: .milliseconds(800 * (attempt + 1)))
                 }
             }
         }
@@ -285,8 +331,24 @@ final class DownloadEngine {
         return chunks
     }
 
-    /// 探测文件大小：先 HEAD，失败再用 Range: bytes=0-0 读 Content-Range
+    /// 探测文件大小：优先用 `Range: bytes=0-0`（返回 206 才能确认服务器支持分段下载），
+    /// 失败再退回 HEAD。返回 nil 表示不能分段，调用方会退化为单连接下载。
     private func probeSize(url: URL) async throws -> Int64? {
+        var range = URLRequest(url: url)
+        range.cachePolicy = .reloadIgnoringLocalCacheData
+        range.setValue("bytes=0-0", forHTTPHeaderField: "Range")
+        if let (_, resp) = try? await URLSession.shared.data(for: range),
+           let http = resp as? HTTPURLResponse {
+            if http.statusCode == 206,
+               let contentRange = http.value(forHTTPHeaderField: "Content-Range"),
+               let last = contentRange.split(separator: "/").last,
+               let total = Int64(last.trimmingCharacters(in: .whitespaces)), total > 0 {
+                return total
+            }
+            // 返回 200 说明服务器忽略了 Range，不能分段
+            if http.statusCode == 200 { return nil }
+        }
+
         var head = URLRequest(url: url)
         head.httpMethod = "HEAD"
         head.cachePolicy = .reloadIgnoringLocalCacheData
@@ -297,18 +359,11 @@ final class DownloadEngine {
            let total = Int64(len), total > 0 {
             return total
         }
-
-        var req = URLRequest(url: url)
-        req.cachePolicy = .reloadIgnoringLocalCacheData
-        req.setValue("bytes=0-0", forHTTPHeaderField: "Range")
-        let (_, resp) = try await URLSession.shared.data(for: req)
-        guard let http = resp as? HTTPURLResponse else { throw DownloadError.badResponse }
-        if http.statusCode == 206,
-           let range = http.value(forHTTPHeaderField: "Content-Range"),
-           let last = range.split(separator: "/").last,
-           let total = Int64(last.trimmingCharacters(in: .whitespaces)), total > 0 {
-            return total
-        }
         return nil
+    }
+
+    private static func isCancellation(_ error: Error) -> Bool {
+        if error is CancellationError { return true }
+        return (error as NSError).code == NSURLErrorCancelled
     }
 }

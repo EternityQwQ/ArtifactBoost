@@ -57,7 +57,11 @@ struct RepoListView: View {
             .navigationTitle("我的仓库")
             .searchable(text: $searchText, prompt: "输入关键词，回车远程搜索")
             .onSubmit(of: .search) {
-                Task { await remoteSearch() }
+                if searchText.trimmingCharacters(in: .whitespaces).isEmpty {
+                    Task { await loadRepos() }
+                } else {
+                    Task { await remoteSearch() }
+                }
             }
             .navigationDestination(for: GHRepo.self) { repo in
                 RunListView(repo: repo)
@@ -95,7 +99,7 @@ struct RepoListView: View {
             }
             repos = all
         } catch {
-            errorMessage = error.localizedDescription
+            errorMessage = session.message(for: error)
         }
     }
 
@@ -107,7 +111,7 @@ struct RepoListView: View {
         do {
             repos = try await client.searchRepos(keyword: searchText)
         } catch {
-            errorMessage = error.localizedDescription
+            errorMessage = session.message(for: error)
         }
     }
 }

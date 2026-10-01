@@ -1,5 +1,7 @@
 # ArtifactBoost — GitHub Actions 产物加速下载（iOS）
 
+[![Build ArtifactBoost](https://github.com/yitenchen123/ArtifactBoost/actions/workflows/build.yml/badge.svg)](https://github.com/yitenchen123/ArtifactBoost/actions/workflows/build.yml)
+
 一个原生 SwiftUI iOS 应用：登录 GitHub，浏览仓库的 Actions 运行记录与产物，用**多线程分段并发下载**大幅加速产物拉取。
 
 ## 为什么镜像站加速不了 Actions 产物？
@@ -23,23 +25,41 @@ ghproxy 等公开镜像无法携带你的 Token 去请求这个接口，所以�
 - 自动重试（每段最多 3 次）、可随时取消
 - 下载完成后一键导出到「文件」App / 分享
 
-## 构建运行（需要 Mac + Xcode，约 5 分钟）
+## 安装到 iPhone（三种方式，任选一种）
 
-1. Mac 上安装 Xcode 15 或更新版本（App Store 免费下载）
-2. 打开 Xcode → **Create New Project** → **iOS → App**
-   - Product Name：`ArtifactBoost`
-   - Interface：**SwiftUI**，Language：**Swift**
-   - 其他保持默认
-3. 删除 Xcode 自动生成的 `ContentView.swift` 和 `ArtifactBoostApp.swift`
-4. 把本项目的 `Sources` 文件夹里的全部 `.swift` 文件拖进 Xcode 左侧项目导航
-   （勾选 **Copy items if needed**，Target 勾选 **ArtifactBoost**）
-5. 选中 TARGETS → ArtifactBoost → **General**：
-   - Minimum Deployments 设为 **iOS 16.0**
-   - **Signing & Capabilities** 里 Team 选择你的 Apple ID（免费 Personal Team 即可，真机可运行 7 天，到期重签即可）
-6. 连上 iPhone，选中设备，按 `⌘R` 运行
+### 方式 A：直接下载 CI 构建好的安装包（没有 Mac 也能用）
 
-> 如果你装了 [XcodeGen](https://github.com/yonaskolb/XcodeGen)，也可以直接在项目根目录跑
-> `xcodegen generate` 用附带的 `project.yml` 自动生成工程，省去第 2–4 步。
+1. 打开本仓库的 **Actions** 页面 → 选最新一次成功的 **Build ArtifactBoost**
+2. 在页面底部的 **Artifacts** 区域下载 **ArtifactBoost-unsigned.ipa**
+3. 在电脑上用免费工具自签安装到手机（未签名包不能直接双击安装）：
+   - **Sideloadly**（Windows / macOS，最省事）：拖入 ipa → 填 Apple ID → Start
+   - **AltStore / SideStore**：把 ipa 放进 AltStore 后安装
+   - 免费 Apple ID 签名的 App 有效期为 7 天，到期重签一次即可
+4. 装好后打开 App，粘贴 Token 登录即可使用
+
+> 同一个 Artifacts 里还有 **ArtifactBoost-simulator.zip**，是给 Mac 上的 iOS 模拟器用的。
+
+### 方式 B：Mac + Xcode 本地运行
+
+1. Mac 上安装 **Xcode 16 或更新版本**（XcodeGen 生成的是新版工程格式，Xcode 15 打不开）
+2. 安装 XcodeGen 并生成工程：
+
+   ```bash
+   brew install xcodegen
+   xcodegen generate
+   open ArtifactBoost.xcodeproj
+   ```
+
+3. 选中 TARGETS → ArtifactBoost → **Signing & Capabilities**，Team 选择你的 Apple ID（免费 Personal Team 即可）
+4. 连上 iPhone，选中设备，按 `⌘R` 运行
+
+### 方式 C：纯手工建工程（不使用 XcodeGen）
+
+1. 打开 Xcode → **Create New Project** → **iOS → App**
+   - Product Name：`ArtifactBoost`；Interface：**SwiftUI**；Language：**Swift**
+2. 删除 Xcode 自动生成的 `ContentView.swift` 和 `ArtifactBoostApp.swift`
+3. 把 `Sources` 里的全部 `.swift` 文件拖进项目导航（勾选 **Copy items if needed**，Target 勾选 ArtifactBoost）
+4. General 里把 Minimum Deployments 设为 **iOS 16.0**，Signing 里选好自己的 Team，`⌘R` 运行
 
 ## 创建 Token（二选一）
 
@@ -62,7 +82,7 @@ ghproxy 等公开镜像无法携带你的 Token 去请求这个接口，所以�
 
 ## 注意事项
 
-- 下载时请保持 App 在前台（iOS 会暂停后台 App 的网络任务）
+- 下载时尽量保持 App 在前台：已申请系统后台任务，切走后有约 30 秒缓冲，之后 iOS 仍会暂停网络任务
 - 大文件建议在 Wi-Fi 下下载
 - GitHub 产物默认保留 90 天，过期的产物（列表里标红「已过期」）无法下载
 - 加速的原理是绕过单连接限速，无法突破你本地网络的物理带宽上限

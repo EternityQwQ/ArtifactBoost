@@ -1,6 +1,18 @@
 name: ArtifactBoost
+
 options:
   bundleIdPrefix: com.local
+  deploymentTarget:
+    iOS: "16.0"
+  createIntermediateGroups: true
+  groupSortPosition: top
+
+settings:
+  base:
+    # 固定 Swift 5 语言模式：Xcode 16 的 Swift 6 严格并发检查会拒绝本项目里的
+    # URLSession 代理写法，显式声明可保证本地与 CI 行为一致
+    SWIFT_VERSION: "5.0"
+
 targets:
   ArtifactBoost:
     type: application
@@ -10,8 +22,21 @@ targets:
       - path: Sources
     settings:
       base:
+        PRODUCT_NAME: ArtifactBoost
         PRODUCT_BUNDLE_IDENTIFIER: com.local.ArtifactBoost
-        GENERATE_INFOPLIST_FILE: YES
-        INFOPLIST_KEY_UILaunchScreen_Generation: YES
-        INFOPLIST_KEY_UISupportedInterfaceOrientations: UIInterfaceOrientationPortrait
+        MARKETING_VERSION: "1.1"
+        CURRENT_PROJECT_VERSION: "1"
         TARGETED_DEVICE_FAMILY: "1,2"
+        GENERATE_INFOPLIST_FILE: YES
+        INFOPLIST_KEY_CFBundleDisplayName: ArtifactBoost
+        INFOPLIST_KEY_UILaunchScreen_Generation: YES
+        INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents: YES
+        INFOPLIST_KEY_UISupportedInterfaceOrientations: UIInterfaceOrientationPortrait
+        # 让「文件」App 能直接看到下载目录（我的 iPhone → ArtifactBoost）
+        INFOPLIST_KEY_UIFileSharingEnabled: YES
+        INFOPLIST_KEY_LSSupportsOpeningDocumentsInPlace: YES
+        CODE_SIGN_STYLE: Automatic
+    # 显式生成共享 scheme，保证 CI 里 xcodebuild -scheme ArtifactBoost 一定能用
+    scheme:
+      testTargets: []
+      gatherCoverageData: false

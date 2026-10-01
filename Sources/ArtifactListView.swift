@@ -4,6 +4,7 @@ struct ArtifactListView: View {
     let repo: GHRepo
     let run: GHWorkflowRun
 
+    @EnvironmentObject private var session: SessionManager
     @StateObject private var dm: DownloadManager
     @State private var artifacts: [GHArtifact] = []
     @State private var isLoading = false
@@ -153,7 +154,7 @@ struct ArtifactListView: View {
         do {
             artifacts = try await dm.client.artifacts(repo: repo, run: run)
         } catch {
-            errorMessage = error.localizedDescription
+            errorMessage = session.message(for: error)
         }
     }
 }
