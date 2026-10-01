@@ -14,8 +14,10 @@ enum GitHubError: LocalizedError {
         case .http(let code, let message):
             switch code {
             case 401: return "Token 无效或已过期（401），请重新登录"
-            case 403: return "权限不足或触发限流（403）\(message)"
-            case 404: return "未找到资源，请检查 Token 权限（404）"
+            case 403:
+                return "权限不足或触发限流（403）\(message)\n如果是别人的公开仓库：fine-grained Token 需要勾选 Public Repositories 只读；classic Token 勾了 repo 即可。"
+            case 404:
+                return "未找到（404）：仓库不存在、是私有仓库，或你的 Token 没有被授权访问它。"
             default: return "请求失败（\(code)）\(message)"
             }
         case .artifactExpired: return "该产物已过期，GitHub 已将其删除"
@@ -26,6 +28,23 @@ enum GitHubError: LocalizedError {
 
 private struct GHErrorMessage: Codable {
     let message: String?
+}
+
+/// 搜索排序方式
+enum RepoSort: String, CaseIterable, Identifiable {
+    case bestMatch
+    case stars
+    case updated
+
+    var id: String { rawValue }
+
+    var title: String {
+        switch self {
+        case .bestMatch: return "最佳匹配"
+        case .stars: return "星标最多"
+        case .updated: return "最近更新"
+        }
+    }
 }
 
 final class GitHubClient {
@@ -81,13 +100,29 @@ final class GitHubClient {
         ])
     }
 
-    /// 远程搜索仓库
-    func searchRepos(keyword: String) async throws -> [GHRepo] {
-        let resp: RepoSearchResponse = try await get("search/repositories", query: [
+    /// 搜索全站仓库：不限于自己的仓库，别人的公开仓库也能搜到并下载
+    func searchRepos(keyword: String, sort: RepoSort = .bestMatch) async throws -> [GHRepo] {
+        var query: [URLQueryItem] = [
             URLQueryItem(name: "q", value: keyword),
-            URLQueryItem(name: "per_page", value: "30"),
-        ])
+            URLQueryItem(name: "per_page", value: "40"),
+        ]
+        switch sort {
+        case .bestMatch:
+            break
+        case .stars:
+            query.append(URLQueryItem(name: "sort", value: "stars"))
+            query.append(URLQueryItem(name: "order", value: "desc"))
+        case .updated:
+            query.append(URLQueryItem(name: "sort", value: "updated"))
+            query.append(URLQueryItem(name: "order", value: "desc"))
+        }
+        let resp: RepoSearchResponse = try await get("search/repositories", query: query)
         return resp.items
+    }
+
+    /// 按 owner/repo 取单个仓库（「直接打开仓库」用）
+    func repo(fullName: String) async throws -> GHRepo {
+        try await get("repos/\(fullName)")
     }
 
     /// 仓库最近的 workflow 运行记录

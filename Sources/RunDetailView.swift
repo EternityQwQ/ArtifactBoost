@@ -74,44 +74,39 @@ struct RunDetailView: View {
         VStack(alignment: .leading, spacing: 10) {
             HStack(spacing: 10) {
                 IconBadge(systemName: Theme.runIcon(conclusion: run.conclusion, status: run.status),
-                          color: .white,
-                          size: 40)
-                    .background(.white.opacity(0.18), in: RoundedRectangle(cornerRadius: 11, style: .continuous))
+                          color: Theme.runColor(conclusion: run.conclusion, status: run.status),
+                          size: 38)
 
-                VStack(alignment: .leading, spacing: 3) {
+                VStack(alignment: .leading, spacing: 2) {
                     Text(run.displayTitle ?? run.name ?? "Workflow")
                         .font(.headline)
-                        .foregroundStyle(.white)
                         .lineLimit(2)
-                    Text("\(repo.name) · #\(run.runNumber)")
+                    Text("\(repo.fullName) · #\(run.runNumber)")
                         .font(.caption2)
-                        .foregroundStyle(.white.opacity(0.8))
+                        .foregroundStyle(Theme.subtle)
+                        .lineLimit(1)
                 }
+
                 Spacer(minLength: 0)
+
+                StatusPill(text: Theme.runText(conclusion: run.conclusion, status: run.status),
+                           color: Theme.runColor(conclusion: run.conclusion, status: run.status))
             }
 
             HStack(spacing: 8) {
-                StatusPill(text: Theme.runText(conclusion: run.conclusion, status: run.status),
-                           color: .white)
-                StatusPill(text: run.headBranch ?? "-", color: .white, systemImage: "arrow.triangle.branch")
+                StatusPill(text: run.headBranch ?? "-", color: Theme.muted, systemImage: "arrow.triangle.branch")
                 if let event = run.event {
-                    StatusPill(text: event, color: .white)
+                    StatusPill(text: event, color: Theme.muted)
                 }
             }
 
             if let date = run.createdAt {
                 Text(date.formatted(date: .complete, time: .shortened))
                     .font(.caption2)
-                    .foregroundStyle(.white.opacity(0.8))
+                    .foregroundStyle(Theme.subtle)
             }
         }
-        .padding(16)
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .background(
-            LinearGradient(colors: [Theme.accent.opacity(0.95), Theme.purple.opacity(0.9)],
-                           startPoint: .topLeading, endPoint: .bottomTrailing),
-            in: RoundedRectangle(cornerRadius: 18, style: .continuous)
-        )
+        .card()
     }
 
     private func load() async {

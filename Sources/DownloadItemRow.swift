@@ -64,6 +64,7 @@ struct DownloadItemRow: View {
                     .frame(maxWidth: .infinity)
             }
             .buttonStyle(.borderedProminent)
+            .tint(Theme.green)
             .controlSize(.regular)
             .disabled(disabled)
 
