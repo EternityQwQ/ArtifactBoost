@@ -54,7 +54,7 @@ final class GitHubClient {
         self.token = token
     }
 
-    private func makeURL(_ path: String, query: [URLQueryItem] = []) throws -> URL {
+    func makeURL(_ path: String, query: [URLQueryItem] = []) throws -> URL {
         var comps = URLComponents(string: "https://api.github.com")
         comps?.path = "/" + path
         if !query.isEmpty { comps?.queryItems = query }
@@ -62,7 +62,7 @@ final class GitHubClient {
         return url
     }
 
-    private func authorizedRequest(_ url: URL) -> URLRequest {
+    func authorizedRequest(_ url: URL) -> URLRequest {
         var req = URLRequest(url: url)
         req.cachePolicy = .reloadIgnoringLocalCacheData
         req.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
@@ -72,8 +72,8 @@ final class GitHubClient {
     }
 
     private func get<T: Decodable>(_ path: String, query: [URLQueryItem] = []) async throws -> T {
-        let url = try makeURL(path, query: query)
-        let (data, resp) = try await URLSession.shared.data(for: authorizedRequest(url))
+        let request = authorizedRequest(try makeURL(path, query: query))
+        let (data, resp) = try await URLSession.shared.data(for: request)
         guard let http = resp as? HTTPURLResponse else { throw GitHubError.badResponse }
         guard (200..<300).contains(http.statusCode) else {
             let msg = (try? JSONDecoder().decode(GHErrorMessage.self, from: data))?.message ?? ""
@@ -210,5 +210,66 @@ private final class RedirectCatcher: NSObject, URLSessionTaskDelegate {
                     newRequest request: URLRequest,
                     completionHandler: @escaping (URLRequest?) -> Void) {
         completionHandler(nil)
+    }
+}
+
+// MARK: - README 与提交数（仓库详情页用）
+
+extension GitHubClient {
+    /// 取仓库 README 的 Markdown 原文。
+    /// `?ref=` 跟随当前选中的分支；`Accept: application/vnd.github.raw` 直接返回纯文本，
+    /// 省掉一次 base64 解码。404 表示没有 README，返回 nil 而不是抛错。
+    func readme(repo: GHRepo, ref: String? = nil) async throws -> GHReadme? {
+        var query: [URLQueryItem] = []
+        let target = ref?.isEmpty == false ? ref! : (repo.defaultBranch ?? "")
+        if !target.isEmpty {
+            query.append(URLQueryItem(name: "ref", value: target))
+        }
+
+        var request = authorizedRequest(try makeURL("repos/\(repo.fullName)/readme", query: query))
+        request.setValue("application/vnd.github.raw", forHTTPHeaderField: "Accept")
+
+        let (data, resp) = try await URLSession.shared.data(for: request)
+        guard let http = resp as? HTTPURLResponse else { throw GitHubError.badResponse }
+        if http.statusCode == 404 { return nil }
+        guard (200..<300).contains(http.statusCode) else {
+            let msg = (try? JSONDecoder().decode(GHErrorMessage.self, from: data))?.message ?? ""
+            throw GitHubError.http(http.statusCode, msg)
+        }
+        guard let text = String(data: data, encoding: .utf8), !text.isEmpty else { return nil }
+        return GHReadme(path: readmePath(from: http) ?? "README.md", text: text)
+    }
+
+    /// README 接口在响应里带了文件路径的 base64，解出来用于标题展示（失败就退回默认名）
+    private func readmePath(from response: HTTPURLResponse) -> String? {
+        guard let raw = response.value(forHTTPHeaderField: "Content-Location") else { return nil }
+        return raw.split(separator: "/").last.map { String($0) }
+    }
+
+    /// 默认分支上的提交数（GitHub 用 Link 头的 last 页号给出，per_page=1 只需一次请求）。
+    /// 拿不到就返回 nil，界面自动隐藏这一项。
+    func commitCount(repo: GHRepo) async throws -> Int? {
+        let query = [
+            URLQueryItem(name: "sha", value: repo.defaultBranch ?? "HEAD"),
+            URLQueryItem(name: "per_page", value: "1"),
+        ]
+        let (_, resp) = try await URLSession.shared.data(
+            for: authorizedRequest(try makeURL("repos/\(repo.fullName)/commits", query: query))
+        )
+        guard let http = resp as? HTTPURLResponse else { return nil }
+        guard (200..<300).contains(http.statusCode) else { return nil }
+        guard let link = http.value(forHTTPHeaderField: "Link") else { return nil }
+        return lastPageNumber(in: link)
+    }
+
+    /// 从 `Link: <...?page=42>; rel="last"` 里抠出 42
+    private func lastPageNumber(in linkHeader: String) -> Int? {
+        for segment in linkHeader.split(separator: ",") {
+            guard segment.contains("rel=\"last\"") else { continue }
+            guard let range = segment.range(of: "page=") else { continue }
+            let digits = segment[range.upperBound...].prefix { $0.isNumber }
+            if let value = Int(digits) { return value }
+        }
+        return nil
     }
 }

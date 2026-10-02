@@ -83,8 +83,7 @@ struct RepoCardRow: View {
 
     var body: some View {
         HStack(alignment: .top, spacing: 12) {
-            IconBadge(systemName: repo.isPrivate ? "lock.fill" : "book.closed.fill",
-                      color: repo.isPrivate ? Theme.yellow : Theme.blue)
+            RepoAvatarView(owner: repo.owner, size: 34, isPrivate: repo.isPrivate)
 
             VStack(alignment: .leading, spacing: 4) {
                 HStack(spacing: 0) {
@@ -117,7 +116,7 @@ struct RepoCardRow: View {
                 }
 
                 if let date = repo.updatedAt {
-                    Text("更新于 \(date.formatted(date: .numeric, time: .omitted))")
+                    Text("更新于 \(formatRelative(date))")
                         .font(.caption2)
                         .foregroundStyle(Theme.subtle)
                 }

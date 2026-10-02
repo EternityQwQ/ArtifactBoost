@@ -39,6 +39,8 @@ enum Theme {
     static let border = Color.adaptive(light: 0xD0D7DE, dark: 0x30363D)
 
     static let accent = blue
+    static let strongText = Color.adaptive(light: 0x1F2328, dark: 0xE6EDF3)
+    static let canvasInvertedText = Color.adaptive(light: 0x1F2328, dark: 0xE6EDF3)
 
     // MARK: - 语义色
 
@@ -218,9 +220,11 @@ struct EmptyStateView: View {
 
 /// 卡片容器：浅色/深色下都有清晰边界（GitHub 的 box 风格）
 struct CardBackground: ViewModifier {
+    var padding: CGFloat = 14
+
     func body(content: Content) -> some View {
         content
-            .padding(14)
+            .padding(padding)
             .frame(maxWidth: .infinity, alignment: .leading)
             .background(Theme.surface, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
             .overlay {
@@ -231,8 +235,8 @@ struct CardBackground: ViewModifier {
 }
 
 extension View {
-    func card() -> some View {
-        modifier(CardBackground())
+    func card(padding: CGFloat = 14) -> some View {
+        modifier(CardBackground(padding: padding))
     }
 }
 

@@ -20,15 +20,20 @@ struct GHRepo: Codable, Identifiable, Hashable {
     let stargazersCount: Int?
     let forksCount: Int?
     let description: String?
+    /// 分支数（列表接口不会返回，详情接口才有）
+    let forks: Int?
+    /// 未关闭的 issue 数（详情接口才有）
+    let openIssuesCount: Int?
 
     enum CodingKeys: String, CodingKey {
-        case id, name, language, description
+        case id, name, language, description, forks
         case fullName = "full_name"
         case isPrivate = "private"
         case updatedAt = "updated_at"
         case defaultBranch = "default_branch"
         case stargazersCount = "stargazers_count"
         case forksCount = "forks_count"
+        case openIssuesCount = "open_issues_count"
     }
 
     var owner: String { fullName.split(separator: "/").first.map(String.init) ?? "" }
@@ -132,4 +137,12 @@ struct GHReleaseAsset: Codable, Identifiable, Hashable {
 struct GHBranch: Codable, Identifiable, Hashable {
     let name: String
     var id: String { name }
+}
+
+/// README 原文（走 `Accept: application/vnd.github.raw`，直接拿到 Markdown 文本）
+struct GHReadme: Hashable {
+    /// 仓库内的文件路径，例如 docs/README.md
+    let path: String
+    /// Markdown 正文
+    let text: String
 }
