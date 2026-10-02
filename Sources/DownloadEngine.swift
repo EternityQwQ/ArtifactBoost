@@ -1213,8 +1213,11 @@ final class DownloadEngine: @unchecked Sendable {
         #if canImport(Darwin)
         var limit = rlimit()
         guard getrlimit(RLIMIT_NOFILE, &limit) == 0 else { return }
-        let target: rlim_t = limit.rlim_max == RLIM_INFINITY
-            ? RLIM_INFINITY
+        // 注意：Swift 不导入 Darwin 的 RLIM_INFINITY 宏（它带 C 类型转换，
+        // 展开值是 ((uint64_t)1 << 63) - 1），只能自己写这个数。
+        let rlimInfinity: rlim_t = 0x7FFF_FFFF_FFFF_FFFF
+        let target: rlim_t = limit.rlim_max == rlimInfinity
+            ? rlimInfinity
             : min(limit.rlim_max, 8192)
         guard limit.rlim_cur < target else { return }
         limit.rlim_cur = target
