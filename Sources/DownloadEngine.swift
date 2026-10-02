@@ -135,31 +135,9 @@ private final class SlicePool: @unchecked Sendable {
         return queue.count
     }
 
-    init(total: Int64, slices: Int = 1) {
+    init(total: Int64) {
         self.total = total
-        // 预切分：首轮就能派满 lanes 条连接，避免单区间导致的调度饿死（1/64）。
-        // 按 lanes*4 均分，尾块吃余数；块太小（<64KB）时自动收敛，避免 Task 爆炸。
-        let target = max(1, slices)
-        if target <= 1 || total <= 0 {
-            queue = [Chunk(start: 0, end: total - 1)]
-        } else {
-            let maxSlices = max(1, Int(total / (64 * 1024)))
-            let count = max(1, min(target, maxSlices))
-            if count <= 1 {
-                queue = [Chunk(start: 0, end: total - 1)]
-            } else {
-                var parts: [Chunk] = []
-                parts.reserveCapacity(count)
-                let base = total / Int64(count)
-                var start: Int64 = 0
-                for i in 0..<count {
-                    let end = (i == count - 1) ? total - 1 : start + base - 1
-                    parts.append(Chunk(start: start, end: end))
-                    start = end + 1
-                }
-                queue = parts
-            }
-        }
+        queue = [Chunk(start: 0, end: total - 1)]
     }
 
     func downloaded() -> Int64 {
@@ -584,7 +562,11 @@ final class DownloadEngine: @unchecked Sendable {
             outURL = outDir.appendingPathComponent("\(UUID().uuidString.prefix(6))-\(fileName)")
         }
 
-        let lanes = max(1, min(connections, 64))
+        // 极限档并发意味着几百条 socket：先把 fd soft limit 顶到 hard 上限，
+        // 否则默认值（常见 256）会在建连一半时报 too many open files。
+        Self.raiseFileLimit()
+
+        let lanes = max(1, min(connections, Self.maxLanes))
 
         // 先探测体积 + 确认服务器是否真的支持 Range
         let probe = allowChunking ? try await probeSize(urls: urls) : nil
@@ -662,16 +644,14 @@ final class DownloadEngine: @unchecked Sendable {
         // 关键：Cloudflare 这类 CDN 会协商 HTTP/2，所有请求被多路复用到同一条 TCP 连接上，
         // 长链路下单连接带宽就是天花板，开再多"连接"也没用。
         // 每个 URLSession 有独立的连接池，拆成多个会话才能真正拿到多条并行连接。
-        let sessionCount = min(4, max(1, lanes / 8))
+        let sessionCount = min(8, max(1, lanes / 8))
         let perSessionLimit = max(1, lanes / sessionCount)
         var sessions: [URLSession] = []
         for _ in 0..<sessionCount {
             let config = URLSessionConfiguration.ephemeral
             config.timeoutIntervalForRequest = 60
             config.timeoutIntervalForResource = 3600
-            // 单通道时所有 lane 会落在同一 session，perSessionLimit 会把 64 并发限流成排队。
-            // 直接放宽到 64+，真正的节流由 allowedLanes/quota/退避负责，URLSession 只负责别排队。
-            config.httpMaximumConnectionsPerHost = max(64, perSessionLimit)
+            config.httpMaximumConnectionsPerHost = perSessionLimit
             sessions.append(URLSession(configuration: config))
         }
         setSessions(sessions)
@@ -706,8 +686,7 @@ final class DownloadEngine: @unchecked Sendable {
         defer { try? handle.close() }
         try handle.truncate(atOffset: UInt64(total))
 
-        // 预切分 lanes*4：首轮就能派满并发，避免“池子只有 1 个区间→只能派出 1 条→调度阻塞在 group.next()”的 1/64 饿死。
-        let pool = SlicePool(total: total, slices: lanes * 4)
+        let pool = SlicePool(total: total)
         let sink = WriteSink(handle: handle)
 
         try await withThrowingTaskGroup(of: Void.self) { group in
@@ -718,7 +697,7 @@ final class DownloadEngine: @unchecked Sendable {
             // 起步瞬间几百个请求同时砸过去，Azure/Cloudflare 会直接回 503 ServerBusy，
             // 一旦被限流就得指数退避，整段下载反而更慢。
             // 改成每 connectionRampInterval 秒放一档，跑到目标并发后再全速调度。
-            var allowedLanes = min(Self.rampStep, lanes)
+            var allowedLanes = min(Self.rampStep(for: lanes), lanes)
             var lastRampAt = Date()
 
             while true {
@@ -729,7 +708,7 @@ final class DownloadEngine: @unchecked Sendable {
                 let now = Date()
                 if allowedLanes < lanes,
                    now.timeIntervalSince(lastRampAt) >= Self.connectionRampInterval {
-                    allowedLanes = min(allowedLanes + Self.rampStep, lanes)
+                    allowedLanes = min(allowedLanes + Self.rampStep(for: lanes), lanes)
                     lastRampAt = now
                 }
 
@@ -812,12 +791,7 @@ final class DownloadEngine: @unchecked Sendable {
 
     // MARK: - 一个 worker 的生命周期
 
-    /// 单片任务：只做一片即退出，由调度循环负责派下一片。
-    ///
-    /// 老实现是常驻 worker（while 循环内自己取下一片），与调度器的
-    /// “await group.next() 即有空位”假设互斥：池子初始只有 1 个区间时首轮
-    /// 只能派出 1 条，随后调度阻塞等待该 worker 退出（而它永远不退出），
-    /// 于是恒为 1/64。这里改为一片一任务，调度才能真正跑满并发。
+    /// 攥着一段区间，一小片一小片地取数据；取完就要新活儿，绝不空转。
     private func runSlice(laneId: Int,
                           channel: RouteChannel,
                           initial: Chunk,
@@ -827,92 +801,104 @@ final class DownloadEngine: @unchecked Sendable {
                           sink: WriteSink,
                           accumulator: ProgressAccumulator,
                           board: LaneBoard) async {
-        if isCancelled { return }
-        // 被取消就立刻收工，不再取新数据
-        if Task.isCancelled { return }
+        var current = initial
 
-        let remaining = max(total - pool.downloaded(), 0)
-        let want = max(1, min(sliceTarget(lanes: lanes, total: total, remaining: remaining),
-                              Int(initial.length)))
-        let from = initial.start
-        let to = from + Int64(want) - 1
+        while !isCancelled {
+            // 被取消就立刻收工，不再取新数据
+            if Task.isCancelled { return }
 
-        if to < initial.end {
-            // 手里这段比一小片长：把「剩下的」还回池子。
-            // 还回去之后必须立刻放弃对它的所有权 —— 也就是只干 [from, to]，
-            // 绝不再引用后半段，否则同一段字节会同时存在于池子和这个任务手上。
-            pool.putBack(Chunk(start: to + 1, end: initial.end))
-            board.bumpSplit()
-        }
+            let remaining = max(total - pool.downloaded(), 0)
+            let want = max(1, min(sliceTarget(lanes: lanes, total: total, remaining: remaining),
+                                  Int(current.length)))
+            let from = current.start
+            let to = from + Int64(want) - 1
 
-        // 派活前先更新看板：面板能立刻看到这条车道换到了哪一段
-        board.update(LaneSnapshot(laneId: laneId,
-                                  routeName: channel.name,
-                                  url: channel.current.absoluteString,
-                                  start: from,
-                                  end: to,
-                                  downloaded: 0,
-                                  speedBytesPerSecond: channel.measuredSpeed,
-                                  state: .downloading,
-                                  attempt: 1,
-                                  lastStatus: 206))
-        board.activeUrl = channel.current.absoluteString
-
-        do {
-            let outcome = try await fetchSlice(chunk: Chunk(start: from, end: to),
-                                               pool: pool,
-                                               board: board,
-                                               laneId: laneId,
-                                               channel: channel)
-            if !outcome.data.isEmpty {
-                sink.write(outcome.data, at: from)
-                pool.recordDone(Int64(outcome.data.count))
-                await accumulator.advance(Int64(outcome.data.count))
-                channel.observe(elapsed: outcome.elapsed, bytes: Int64(outcome.data.count))
-                board.bumpDoneSlice()
-                board.reward(channel.name)
-
-                let seconds = max(outcome.elapsed, 0.001)
-                board.update(LaneSnapshot(laneId: laneId,
-                                          routeName: channel.name,
-                                          url: channel.current.absoluteString,
-                                          start: from,
-                                          end: to,
-                                          downloaded: Int64(outcome.data.count),
-                                          speedBytesPerSecond: Double(outcome.data.count) / seconds,
-                                          state: .done,
-                                          attempt: 1,
-                                          lastStatus: 206))
+            if to < current.end {
+                // 手里这段比一小片长：把「剩下的」还回池子。
+                // 还回去之后必须立刻放弃对它的所有权 —— 也就是把 current
+                // 收窄成刚切出来的这一小片，绝不再引用后半段。
+                // 否则同一段字节会同时存在于池子和这个 worker 手上，
+                // 池子再把它派给别人，两个 worker 就会下到重叠区间、重复写盘。
+                pool.putBack(Chunk(start: to + 1, end: current.end))
+                board.bumpSplit()
             }
-            if outcome.data.count < want {
-                // 没取满（连接中途断了）：把缺的那一段还回池子重取，绝不丢数据
-                let missing = Chunk(start: from + Int64(outcome.data.count), end: to)
-                if missing.length > 0 { pool.putBack(missing) }
-            }
-        } catch {
-            if isCancelled || Task.isCancelled { return }
-            if (error as? DownloadError) == .cancelled { return }
+            current = Chunk(start: from, end: to)
 
-            // 这一片彻底失败（重试耗尽）：在面板上标红
+            // 派活前先更新看板：面板能立刻看到这条车道换到了哪一段
             board.update(LaneSnapshot(laneId: laneId,
                                       routeName: channel.name,
                                       url: channel.current.absoluteString,
                                       start: from,
                                       end: to,
                                       downloaded: 0,
-                                      speedBytesPerSecond: 0,
-                                      state: .failed,
-                                      attempt: Self.maxAttempts,
-                                      lastStatus: { if case let .throttled(code, _) = (error as? DownloadError) { return code }; return nil }()))
-            // 失败的那一段必须还回池子，否则文件会缺一块
-            pool.putBack(Chunk(start: from, end: to))
+                                      speedBytesPerSecond: channel.measuredSpeed,
+                                      state: .downloading,
+                                      attempt: 1,
+                                      lastStatus: 206))
+            board.activeUrl = channel.current.absoluteString
 
-            sink.markFailed()
-            return
+            do {
+                let outcome = try await fetchSlice(chunk: Chunk(start: from, end: to),
+                                                   pool: pool,
+                                                   board: board,
+                                                   laneId: laneId,
+                                                   channel: channel)
+                if !outcome.data.isEmpty {
+                    sink.write(outcome.data, at: from)
+                    pool.recordDone(Int64(outcome.data.count))
+                    await accumulator.advance(Int64(outcome.data.count))
+                    channel.observe(elapsed: outcome.elapsed, bytes: Int64(outcome.data.count))
+                    board.bumpDoneSlice()
+                    board.reward(channel.name)
+
+                    let seconds = max(outcome.elapsed, 0.001)
+                    board.update(LaneSnapshot(laneId: laneId,
+                                              routeName: channel.name,
+                                              url: channel.current.absoluteString,
+                                              start: from,
+                                              end: to,
+                                              downloaded: Int64(outcome.data.count),
+                                              speedBytesPerSecond: Double(outcome.data.count) / seconds,
+                                              state: .done,
+                                              attempt: 1,
+                                              lastStatus: 206))
+                }
+                if outcome.data.count < want {
+                    // 没取满（连接中途断了）：把缺的那一段还回池子重取，绝不丢数据
+                    let missing = Chunk(start: from + Int64(outcome.data.count), end: to)
+                    if missing.length > 0 { pool.putBack(missing) }
+                }
+            } catch {
+                if isCancelled || Task.isCancelled { return }
+                if (error as? DownloadError) == .cancelled { return }
+
+                // 这一片彻底失败（重试耗尽）：在面板上标红
+                board.update(LaneSnapshot(laneId: laneId,
+                                          routeName: channel.name,
+                                          url: channel.current.absoluteString,
+                                          start: from,
+                                          end: to,
+                                          downloaded: 0,
+                                          speedBytesPerSecond: 0,
+                                          state: .failed,
+                                          attempt: Self.maxAttempts,
+                                          lastStatus: { if case let .throttled(code, _) = (error as? DownloadError) { return code }; return nil }()))
+                // 失败的那一段必须还回池子，否则文件会缺一块
+                pool.putBack(Chunk(start: from, end: to))
+
+                sink.markFailed()
+                return
+            }
+
+            // 这一小片已经干完，回池子重新要活儿。
+            //
+            // 注意这里传的 live = 1：代表「我自己还占着一条连接」。
+            // 老实现传的是 0，而 splitTail 里 `if live <= 0 { return nil }`，
+            // 于是 worker 自己续做时**永远切不动尾部区间** —— 收尾阶段
+            // 池子一空，所有 worker 就只能干等，退化成单连接爬完最后一段。
+            guard let next = nextWork(pool: pool, live: 1, lanes: lanes, total: total) else { return }
+            current = next
         }
-
-        // 单片即走：不再循环取下一片，空位由调度循环统一派发。
-        // 这样 group.next() 每次返回都代表一个空位，调度才能持续补满到 allowedLanes。
     }
 
     /// 分配下一段活儿：优先拿现成的；拿不到而连接还闲着，就从末尾切一刀。
@@ -935,29 +921,20 @@ final class DownloadEngine: @unchecked Sendable {
         return Int(min(max(share, Self.minSliceTarget), Self.maxSliceTarget))
     }
 
-    /// 按实时吞吐加权挑通道：快的多干活，慢的也有活（带宽叠加）。
-    ///
-    /// 老实现是贪心取最快，导致所有 lane 挤在同一条通道/同一 session，
-    /// 既打爆单镜像（429/503）又浪费其它通道带宽，还让多 session 形同虚设。
+    /// 按实时吞吐挑通道：快的多干活
     private func pickChannel(_ channels: [RouteChannel], roundRobin: Int) -> Int {
         guard channels.count > 1 else { return 0 }
-        var total: Double = 0
-        var weights: [Double] = []
-        weights.reserveCapacity(channels.count)
-        for ch in channels {
-            var w = max(ch.measuredSpeed, 1)
-            // 被限流的通道降权 90%，而不是直接剔除（保底不断流）
-            if ch.throttled { w *= 0.1 }
-            weights.append(w)
-            total += w
+        var best = roundRobin % channels.count
+        var bestSpeed = -1.0
+        for offset in channels.indices {
+            let index = (roundRobin + offset) % channels.count
+            let speed = channels[index].measuredSpeed
+            if speed > bestSpeed {
+                bestSpeed = speed
+                best = index
+            }
         }
-        guard total > 0 else { return roundRobin % channels.count }
-        var r = Double.random(in: 0..<total)
-        for (i, w) in weights.enumerated() {
-            r -= w
-            if r <= 0 { return i }
-        }
-        return weights.indices.max(by: { weights[$0] < weights[$1] }) ?? 0
+        return best
     }
 
     // MARK: - 取一小片
@@ -1175,11 +1152,34 @@ final class DownloadEngine: @unchecked Sendable {
     private static let maxAttempts = 3
     private static let userAgent = "ArtifactBoost"
 
+    /// 引擎并发上限（与 AccelerationSettings.maxConnections 一致）
+    private static let maxLanes = 512
+
+    /// 把 fd soft limit 提到 hard 上限：每条连接占一个 fd，
+    /// 并发放开到 128+ 之后，默认 soft limit（常见 256）会在建连一半时报
+    /// 「too many open files」。提升自己的 soft 到 hard 不需要任何特权。
+    /// Linux（typecheck 环境）没有 Darwin 的 rlimit 初始化器，按平台编译。
+    private static func raiseFileLimit() {
+        #if canImport(Darwin)
+        var limit = rlimit()
+        guard getrlimit(RLIMIT_NOFILE, &limit) == 0 else { return }
+        let target: rlim_t = limit.rlim_max == RLIM_INFINITY
+            ? RLIM_INFINITY
+            : min(limit.rlim_max, 8192)
+        guard limit.rlim_cur < target else { return }
+        limit.rlim_cur = target
+        setrlimit(RLIMIT_NOFILE, &limit)
+        #endif
+    }
+
     /// 渐进建连：每档放开多少条并发。
     ///
     /// 爬坡的目的是避开「起步瞬间几百个请求同时砸过去 → 503 ServerBusy」，
-    /// 但步子太小会白白浪费前几秒带宽。16 是个平衡点。
-    private static let rampStep = 16
+    /// 但步子太小会白白浪费前几秒带宽。16 是 64 并发下的平衡点。
+    ///
+    /// 极限档（128/256/512）如果仍按 16/档，爬满要 4.8s，起步太肉 ——
+    /// 所以按 lanes/8 取步长：512 → 64/档 → 8 档 ≈ 1.2s；64 及以下仍是 16/档。
+    private static func rampStep(for lanes: Int) -> Int { max(16, lanes / 8) }
     /// 渐进建连：每档之间间隔多久（配合 rampStep 决定爬坡总时长）
     private static let connectionRampInterval: TimeInterval = 0.15
 
