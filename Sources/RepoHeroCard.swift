@@ -115,30 +115,68 @@ struct RepoHeroCard: View {
     }
 }
 
-/// 仓库图标：私有仓库用锁，公开仓库用书籍（GitHub 移动端风格）
+/// 仓库图标：优先加载仓库所属 owner 的真实头像
+/// （`https://github.com/{owner}.png`，GitHub 官方免鉴权端点），
+/// 加载中/失败时退回「锁 / 书籍」占位图标。
+///
+/// 为什么不用 API 里的 `avatar_url`：那需要额外发一次 `GET /users/{owner}`
+/// 请求，占配额也拖慢列表；而 `github.com/{owner}.png` 是纯 CDN 图片，
+/// 既快又不消耗 API 配额，还能被 URLCache 命中。
 struct RepoAvatarView: View {
     let owner: String
     var size: CGFloat = 44
     var isPrivate: Bool = false
 
+    private var avatarURL: URL? {
+        guard !owner.isEmpty else { return nil }
+        return URL(string: "https://github.com/\(owner).png?size=200")
+    }
+
     var body: some View {
-        RoundedRectangle(cornerRadius: size * 0.28, style: .continuous)
+        RoundedRectangle(cornerRadius: Theme.Radius.small, style: .continuous)
             .fill(Theme.border.opacity(0.4))
             .frame(width: size, height: size)
             .overlay {
-                if isPrivate {
-                    Image(systemName: "lock.fill")
-                        .font(.system(size: size * 0.4, weight: .semibold))
-                        .foregroundStyle(Theme.yellow)
+                if let avatarURL {
+                    AsyncImage(url: avatarURL) { phase in
+                        // 加载中就画占位底色（已有底色），失败才退回图标
+                        if case .success(let image) = phase {
+                            image
+                                .resizable()
+                                .scaledToFill()
+                        } else if case .failure = phase {
+                            fallbackIcon
+                        }
+                    }
+                    .frame(width: size, height: size)
+                    .clipShape(RoundedRectangle(cornerRadius: Theme.Radius.small, style: .continuous))
                 } else {
-                    Image(systemName: "book.closed.fill")
-                        .font(.system(size: size * 0.4, weight: .semibold))
-                        .foregroundStyle(Theme.muted)
+                    fallbackIcon
+                }
+            }
+            .overlay(alignment: .bottomTrailing) {
+                // 私有仓库额外盖一个小锁角标：头像本身看不出可见性
+                if isPrivate {
+                    Circle()
+                        .fill(Theme.surface)
+                        .frame(width: size * 0.44, height: size * 0.44)
+                        .overlay {
+                            Image(systemName: "lock.fill")
+                                .font(.system(size: size * 0.24, weight: .bold))
+                                .foregroundStyle(Theme.yellow)
+                        }
                 }
             }
             .overlay {
-                RoundedRectangle(cornerRadius: size * 0.28, style: .continuous)
+                RoundedRectangle(cornerRadius: Theme.Radius.small, style: .continuous)
                     .stroke(Theme.border, lineWidth: 0.5)
             }
+    }
+
+    /// 拿不到头像时的占位图标（老数据 / 网络失败）
+    private var fallbackIcon: some View {
+        Image(systemName: isPrivate ? "lock.fill" : "book.closed.fill")
+            .font(.system(size: size * 0.4, weight: .semibold))
+            .foregroundStyle(isPrivate ? Theme.yellow : Theme.muted)
     }
 }

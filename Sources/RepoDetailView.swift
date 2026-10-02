@@ -12,13 +12,13 @@ enum RepoTab: String, CaseIterable, Identifiable {
         switch self {
         case .overview: return "概览"
         case .builds: return "构建"
-        case .releases: return "正式版"
+        case .releases: return "发行版"
         case .source: return "源码"
         }
     }
 }
 
-/// 仓库详情：概览（README）/ 构建产物 / 正式版 / 源码，都能加速下载
+/// 仓库详情：概览（README）/ 构建产物 / 发行版 / 源码，都能加速下载
 struct RepoDetailView: View {
     let repo: GHRepo
 
@@ -35,7 +35,7 @@ struct RepoDetailView: View {
     @State private var runs: [GHWorkflowRun] = []
     @State private var runsLoaded = false
 
-    // 正式版
+    // 发行版
     @State private var releases: [GHRelease] = []
     @State private var releasesLoaded = false
 
@@ -74,7 +74,14 @@ struct RepoDetailView: View {
         }
         .task(id: tab) { await load(tab) }
         .task { await loadHeaderStats() }
-        .refreshable { await load(tab, force: true) }
+        .refreshable {
+            // 下拉刷新要「整页一起刷」：当前 tab 的内容 + 顶部统计。
+            // 老实现只重跑 load(tab)，提交数这类 header 统计会一直挂着旧值，
+            // 用户下拉后看到数字没变会以为刷新失效。
+            async let content: Void = load(tab, force: true)
+            async let stats: Void = loadHeaderStats()
+            _ = await (content, stats)
+        }
         .navigationDestination(for: GHWorkflowRun.self) { run in
             RunDetailView(repo: repo, run: run)
         }
@@ -165,7 +172,7 @@ struct RepoDetailView: View {
                     Label("README 读取失败", systemImage: "exclamationmark.triangle")
                         .font(.subheadline.weight(.semibold))
                         .foregroundStyle(Theme.muted)
-                    Text("跳过 README 直接看下面的构建 / 正式版 / 源码即可。")
+                    Text("跳过 README 直接看下面的构建 / 发行版 / 源码即可。")
                         .font(.caption)
                         .foregroundStyle(Theme.subtle)
                 }
@@ -179,7 +186,7 @@ struct RepoDetailView: View {
                     Text("这个仓库没有 README")
                         .font(.subheadline.weight(.semibold))
                         .foregroundStyle(Theme.muted)
-                    Text("切到「构建」「正式版」「源码」开始加速下载。")
+                    Text("切到「构建」「发行版」「源码」开始加速下载。")
                         .font(.caption)
                         .foregroundStyle(Theme.subtle)
                 }
@@ -218,7 +225,7 @@ struct RepoDetailView: View {
         }
     }
 
-    // MARK: - 正式版
+    // MARK: - 发行版
 
     @ViewBuilder
     private var releasesTab: some View {
@@ -227,7 +234,7 @@ struct RepoDetailView: View {
         } else if releases.isEmpty && releasesLoaded {
             card {
                 emptyState(systemName: "shippingbox",
-                           title: "还没有正式版",
+                           title: "还没有发行版",
                            message: "该仓库没有发布过 Release")
             }
         } else {
@@ -298,18 +305,18 @@ struct RepoDetailView: View {
 
     // MARK: - 小组件
 
-    private func card<C: View>(padding: CGFloat = 16, @ViewBuilder content: () -> C) -> some View {
+    private func card<C: View>(padding: CGFloat = Theme.Spacing.md, @ViewBuilder content: () -> C) -> some View {
         HStack(spacing: 0) {
             content()
             Spacer(minLength: 0)
         }
         .padding(padding)
-        .background(Theme.surface, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+        .background(Theme.surface, in: RoundedRectangle(cornerRadius: Theme.Radius.medium, style: .continuous))
         .overlay {
-            RoundedRectangle(cornerRadius: 12, style: .continuous)
+            RoundedRectangle(cornerRadius: Theme.Radius.medium, style: .continuous)
                 .stroke(Theme.border, lineWidth: 1)
         }
-        .padding(.horizontal, 16)
+        .padding(.horizontal, Theme.screenPadding)
     }
 
     private func sectionLabel(_ text: String, systemImage: String) -> some View {
@@ -433,9 +440,9 @@ struct InlineBanner: View {
         }
         .padding(12)
         .frame(maxWidth: .infinity, alignment: .leading)
-        .background(color.opacity(0.1), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+        .background(color.opacity(0.1), in: RoundedRectangle(cornerRadius: Theme.Radius.small, style: .continuous))
         .overlay {
-            RoundedRectangle(cornerRadius: 10, style: .continuous)
+            RoundedRectangle(cornerRadius: Theme.Radius.small, style: .continuous)
                 .stroke(color.opacity(0.3), lineWidth: 1)
         }
     }
@@ -525,7 +532,7 @@ private struct ReleaseRow: View {
             } else if release.draft {
                 StatusPill(text: "草稿", color: .gray)
             } else {
-                StatusPill(text: "正式版", color: Theme.green)
+                StatusPill(text: "发行版", color: Theme.green)
             }
 
             Image(systemName: "chevron.right")

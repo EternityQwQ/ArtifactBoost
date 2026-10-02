@@ -25,7 +25,7 @@ struct GitHubTabBar<T: Hashable>: View {
                     button(for: tab)
                 }
             }
-            .padding(.horizontal, 4)
+            .padding(.horizontal, Theme.Spacing.xxs)
         }
         .background(Theme.surface)
         .overlay(alignment: .bottom) { Hairline() }
@@ -36,8 +36,8 @@ struct GitHubTabBar<T: Hashable>: View {
         return Button {
             withAnimation(.snappy(duration: 0.22)) { selection = tab }
         } label: {
-            VStack(spacing: 7) {
-                HStack(spacing: 5) {
+            VStack(spacing: Theme.Spacing.xs) {
+                HStack(spacing: Theme.Spacing.xxs) {
                     Text(title(tab))
                         .font(.subheadline.weight(isSelected ? .semibold : .regular))
                         .foregroundStyle(isSelected ? Theme.strongText : Theme.muted)
@@ -50,8 +50,8 @@ struct GitHubTabBar<T: Hashable>: View {
                             .background(Theme.border.opacity(0.6), in: Capsule())
                     }
                 }
-                .padding(.horizontal, 12)
-                .padding(.top, 12)
+                .padding(.horizontal, Theme.Spacing.sm)
+                .padding(.top, Theme.Spacing.sm)
 
                 Group {
                     if isSelected {
@@ -63,7 +63,7 @@ struct GitHubTabBar<T: Hashable>: View {
                         Color.clear.frame(height: 2.5)
                     }
                 }
-                .padding(.horizontal, 8)
+                .padding(.horizontal, Theme.Spacing.xs)
             }
             .contentShape(Rectangle())
         }

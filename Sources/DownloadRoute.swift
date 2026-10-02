@@ -1,9 +1,28 @@
 import Foundation
 
+/// 通道的作用域：决定它能套在哪种 URL 上。
+///
+/// 这是新增 ghfast 后必须区分的一件事 ——
+/// 常规镜像（gh-proxy 等）是「把已签名的真实地址塞进前缀」，任何地址都能中转；
+/// 而 ghfast.top 只认 `github.com` 原始地址，套到 Azure 签名地址上会直接 400。
+enum RouteScope: Sendable {
+    /// 可用于任何地址（含 Azure 签名地址）
+    case any
+    /// 只能用于 github.com 的原始地址（发行版附件的稳定下载链接）
+    case githubOnly
+}
+
 /// 下载通道：直连 Azure 签名地址，或经由镜像 / 自建反代中转（前缀 + 原始地址）
 struct DownloadRoute: Hashable, Sendable {
     let name: String
     let prefix: String
+    let scope: RouteScope
+
+    init(name: String, prefix: String, scope: RouteScope = .any) {
+        self.name = name
+        self.prefix = prefix
+        self.scope = scope
+    }
 
     static let direct = DownloadRoute(name: "直连", prefix: "")
 
@@ -18,6 +37,26 @@ struct DownloadRoute: Hashable, Sendable {
         DownloadRoute(name: "hk.gh-proxy.com", prefix: "https://hk.gh-proxy.com/"),
         DownloadRoute(name: "moeyy.xyz", prefix: "https://github.moeyy.xyz/"),
     ]
+
+    /// ghfast.top —— **只能用于发行版**。
+    ///
+    /// 它的用法是 `https://ghfast.top/https://github.com/...`，
+    /// 也就是必须给它一个 github.com 的原始地址；
+    /// 构建产物 / 构建日志解析出来的是临时签名地址，套上去会被拒。
+    /// 因此单独归类，只在下载发行版附件时参与候选。
+    static let ghfast = DownloadRoute(
+        name: "ghfast.top",
+        prefix: "https://ghfast.top/",
+        scope: .githubOnly
+    )
+
+    /// 给一次具体下载挑可用的镜像。
+    ///
+    /// - Parameter githubURL: 该下载在 github.com 上的稳定地址；只有发行版有，其余为 nil。
+    ///   为 nil 时 `.githubOnly` 的通道会被剔除。
+    static func mirrors(for githubURL: URL?) -> [DownloadRoute] {
+        githubURL == nil ? builtInMirrors : builtInMirrors + [ghfast]
+    }
 
     func apply(to url: URL) -> URL {
         guard !prefix.isEmpty, let mirrored = URL(string: prefix + url.absoluteString) else { return url }
@@ -121,7 +160,10 @@ struct AccelerationSettings {
     var clampedConnections: Int { max(1, min(connections, 64)) }
 
     /// 当前设置下的候选通道（直连永远保留兜底）
-    func candidateRoutes(isPrivateRepo: Bool = false) -> [DownloadRoute] {
+    ///
+    /// - Parameter githubURL: 该下载在 github.com 上的稳定地址；只有发行版有。
+    ///   非空时 ghfast 才会进入候选（它只认 github.com 原始地址）。
+    func candidateRoutes(isPrivateRepo: Bool = false, githubURL: URL? = nil) -> [DownloadRoute] {
         switch mode {
         case .direct:
             return [.direct]
@@ -131,7 +173,7 @@ struct AccelerationSettings {
             return [DownloadRoute(name: "自定义加速", prefix: prefix), .direct]
         case .smart:
             guard !isPrivateRepo else { return [.direct] }
-            return [.direct] + DownloadRoute.builtInMirrors
+            return [.direct] + DownloadRoute.mirrors(for: githubURL)
         }
     }
 
@@ -142,11 +184,11 @@ struct AccelerationSettings {
     static let savedPlanValidInterval: TimeInterval = 4 * 3600
 
     /// 可以直接沿用的测速结果（有效期内、且不在私有仓库里用镜像）
-    func savedPlan(isPrivateRepo: Bool) -> [ScoredRoute]? {
+    func savedPlan(isPrivateRepo: Bool, githubURL: URL? = nil) -> [ScoredRoute]? {
         guard let route = testedRoute, let testedAt else { return nil }
         guard Date().timeIntervalSince(testedAt) < Self.savedPlanValidInterval else { return nil }
         guard !(isPrivateRepo && !route.isDirect) else { return nil }
-        guard candidateRoutes(isPrivateRepo: isPrivateRepo).contains(route) else { return nil }
+        guard candidateRoutes(isPrivateRepo: isPrivateRepo, githubURL: githubURL).contains(route) else { return nil }
         return [ScoredRoute(route: route, speed: max(testedSpeed, 0.01))]
     }
 
@@ -177,14 +219,23 @@ enum RouteProbe {
     /// 并发测量所有通道，返回按速度从快到慢排序的结果（失败的通道会被丢掉）
     ///
     /// - Parameter knownSize: 已知体积时从文件中段取样，避开 TCP 慢启动
+    /// - Parameter githubURL: ghfast 这类 `.githubOnly` 通道只能用它测
     static func measureAll(among routes: [DownloadRoute],
                            signedURL: URL,
+                           githubURL: URL? = nil,
                            sampleLimit: Int64 = sampleBytes,
                            knownSize: Int64? = nil) async -> [ScoredRoute] {
         let limit = max(64 * 1024, min(sampleLimit, sampleBytes))
         let results = await withTaskGroup(of: ScoredRoute?.self) { group in
             for route in routes {
-                group.addTask { await measure(route: route, signedURL: signedURL, limit: limit, knownSize: knownSize) }
+                let target: URL? = {
+                    switch route.scope {
+                    case .any: return signedURL
+                    case .githubOnly: return githubURL
+                    }
+                }()
+                guard let target else { continue }
+                group.addTask { await measure(route: route, signedURL: target, limit: limit, knownSize: knownSize) }
             }
             var collected: [ScoredRoute] = []
             for await result in group {

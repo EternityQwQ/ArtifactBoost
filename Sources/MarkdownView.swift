@@ -2,15 +2,30 @@ import SwiftUI
 
 /// 轻量 Markdown 渲染，够用于 README：标题 / 段落 / 列表 / 代码块 / 引用 / 表格 / 分割线 / 图片。
 /// 不引入第三方依赖，纯 SwiftUI + AttributedString 做内联样式。
+///
+/// 两个容易踩的坑，这里都专门处理了：
+///  - **badge / 行内图片**：形如 `[![alt](img)](link)`，或段落里夹着 `![](img)`，
+///    必须渲染成图片，而不是把 `![alt](img)` 当成普通链接文字吐出来；
+///  - **表格列对齐**：每行各画各的宽度，各列当然对不齐。这里先量出整列的内容宽度，
+///    再让同一列所有单元格用同一个宽度，上下才会对齐。
 
-enum MDBlock: Hashable {
+/// 一段行内内容：要么是文字（交给 `MarkdownInline` 上样式），要么是一张图片。
+///
+/// badge（shields.io 那种）在 README 里随处可见，必须能被真的画出来 ——
+/// 而 `AttributedString` 里塞不了异步加载的图片，所以图片要单独拎出来当一段。
+enum MDInline: Hashable, Sendable {
+    case text(String)
+    case picture(url: String, alt: String, link: String?)
+}
+
+enum MDBlock: Hashable, Sendable {
     case heading(level: Int, text: String)
-    case paragraph(String)
-    case bullet(text: String, indent: Int)
-    case ordered(number: String, text: String, indent: Int)
-    case quote(String)
+    case paragraph([MDInline])
+    case bullet(segments: [MDInline], indent: Int)
+    case ordered(number: String, segments: [MDInline], indent: Int)
+    case quote([MDInline])
     case code(language: String?, content: String)
-    case table(header: [String], rows: [[String]])
+    case table(header: [[MDInline]], rows: [[[MDInline]]])
     case rule
     case image(url: String, alt: String)
 }
@@ -43,8 +58,8 @@ enum MarkdownParser {
                 continue
             }
 
-            // 分割线
-            if line == "---" || line == "***" || line == "___" {
+            // 分割线（至少 3 个 -, *, _）
+            if isRule(line) {
                 blocks.append(.rule)
                 index += 1
                 continue
@@ -65,11 +80,11 @@ enum MarkdownParser {
 
             // 表格
             if line.contains("|"), index + 1 < lines.count, isTableSeparator(lines[index + 1]) {
-                let header = splitTableRow(line)
-                var rows: [[String]] = []
+                let header = splitTableRow(line).map { InlineScanner($0).scan() }
+                var rows: [[[MDInline]]] = []
                 index += 2
                 while index < lines.count, lines[index].contains("|") {
-                    rows.append(splitTableRow(lines[index]))
+                    rows.append(splitTableRow(lines[index]).map { InlineScanner($0).scan() })
                     index += 1
                 }
                 blocks.append(.table(header: header, rows: rows))
@@ -85,24 +100,18 @@ enum MarkdownParser {
                     buffer.append(String(current.dropFirst()).trimmingCharacters(in: .whitespaces))
                     index += 1
                 }
-                blocks.append(.quote(buffer.joined(separator: " ")))
-                continue
-            }
-
-            // 独占一行的图片
-            if line.hasPrefix("!["), let image = parseImage(line) {
-                blocks.append(.image(url: image.url, alt: image.alt))
-                index += 1
+                blocks.append(.quote(InlineScanner(buffer.joined(separator: " ")).scan()))
                 continue
             }
 
             // 列表
             if let marker = parseListMarker(raw) {
+                let segments = InlineScanner(marker.text).scan()
                 switch marker.kind {
                 case .bullet:
-                    blocks.append(.bullet(text: marker.text, indent: marker.indent))
+                    blocks.append(.bullet(segments: segments, indent: marker.indent))
                 case .ordered(let number):
-                    blocks.append(.ordered(number: number, text: marker.text, indent: marker.indent))
+                    blocks.append(.ordered(number: number, segments: segments, indent: marker.indent))
                 }
                 index += 1
                 continue
@@ -115,23 +124,32 @@ enum MarkdownParser {
                 let current = lines[index]
                 let trimmed = current.trimmingCharacters(in: .whitespaces)
                 if trimmed.isEmpty
+                    || isRule(trimmed)
                     || trimmed.hasPrefix("#")
                     || trimmed.hasPrefix("```")
                     || trimmed.hasPrefix(">")
-                    || trimmed == "---" || trimmed == "***" || trimmed == "___"
+                    || (trimmed.contains("|") && index + 1 < lines.count && isTableSeparator(lines[index + 1]))
                     || parseListMarker(current) != nil {
                     break
                 }
                 buffer.append(trimmed)
                 index += 1
             }
-            blocks.append(.paragraph(buffer.joined(separator: " ")))
+            // 逐行扫描：图片之间的换行不能被吞成空格，否则 badge 会连成一条缝
+            blocks.append(.paragraph(buffer.flatMap { InlineScanner($0).scan() }))
         }
 
         return blocks
     }
 
     // MARK: - 辅助
+
+    private static func isRule(_ line: String) -> Bool {
+        guard line.count >= 3, let first = line.first else { return false }
+        guard first == "-" || first == "*" || first == "_" else { return false }
+        let meaningful = line.filter { $0 != " " }
+        return meaningful.count >= 3 && meaningful.allSatisfy { $0 == first }
+    }
 
     private static func isTableSeparator(_ line: String) -> Bool {
         let trimmed = line.trimmingCharacters(in: .whitespaces)
@@ -144,18 +162,27 @@ enum MarkdownParser {
         var trimmed = line.trimmingCharacters(in: .whitespaces)
         if trimmed.hasPrefix("|") { trimmed.removeFirst() }
         if trimmed.hasSuffix("|") { trimmed.removeLast() }
-        return trimmed.components(separatedBy: "|").map { $0.trimmingCharacters(in: .whitespaces) }
+        return splitOutsideCode(trimmed, separator: "|").map { $0.trimmingCharacters(in: .whitespaces) }
     }
 
-    private static func parseImage(_ line: String) -> (url: String, alt: String)? {
-        guard let openAlt = line.firstIndex(of: "["),
-              let closeAlt = line.firstIndex(of: "]"),
-              let openURL = line.firstIndex(of: "("),
-              let closeURL = line.lastIndex(of: ")"),
-              openAlt < closeAlt, closeAlt < openURL, openURL < closeURL else { return nil }
-        let alt = String(line[line.index(after: openAlt)..<closeAlt])
-        let url = String(line[line.index(after: openURL)..<closeURL])
-        return (url, alt)
+    /// 按分隔符切分，但跳过 `` ` `` 代码段里的分隔符（列名里常有 `a|b`）
+    private static func splitOutsideCode(_ source: String, separator: Character) -> [String] {
+        var result: [String] = []
+        var current = ""
+        var inCode = false
+        for ch in source {
+            if ch == "`" {
+                inCode.toggle()
+                current.append(ch)
+            } else if ch == separator && !inCode {
+                result.append(current)
+                current = ""
+            } else {
+                current.append(ch)
+            }
+        }
+        result.append(current)
+        return result
     }
 
     private struct ListMarker {
@@ -188,6 +215,186 @@ enum MarkdownParser {
     }
 }
 
+// MARK: - 行内扫描
+
+/// 行内扫描器：把文字切成「文本 / 图片」两态。
+///
+/// 支持的图片写法：
+///  - `![alt](url)`               → 直接图片
+///  - `[![alt](img)](link)`       → 可点击的 badge（README 里最常见的形态）
+///  - `<img src="..." alt="...">` → 部分 README 会直接写 HTML
+///
+/// 普通链接 `[文字](url)` 仍走文字路径，不会被误判成图片。
+struct InlineScanner {
+    private let source: String
+
+    init(_ source: String) {
+        self.source = source
+    }
+
+    func scan() -> [MDInline] {
+        var out: [MDInline] = []
+        var text = ""
+        let chars = Array(source)
+        var i = 0
+
+        func flush() {
+            if !text.isEmpty {
+                out.append(.text(text))
+                text = ""
+            }
+        }
+
+        while i < chars.count {
+            // HTML <img ...>
+            if chars[i] == "<", let close = indexOf(chars, ">", from: i), close > i {
+                let tag = String(chars[i...close])
+                if let picture = Self.parseHTMLImage(tag) {
+                    flush()
+                    out.append(picture)
+                    i = close + 1
+                    continue
+                }
+            }
+
+            // [![alt](img)](link) —— badge
+            if hasPrefix(chars, i, "[!["), let parsed = Self.parseBadge(chars, start: i) {
+                flush()
+                out.append(parsed.inline)
+                i = parsed.next
+                continue
+            }
+
+            // ![alt](img)
+            if chars[i] == "!", i + 1 < chars.count, chars[i + 1] == "[",
+               let parsed = Self.parseImage(chars, start: i) {
+                flush()
+                out.append(parsed.inline)
+                i = parsed.next
+                continue
+            }
+
+            text.append(chars[i])
+            i += 1
+        }
+        flush()
+        return out
+    }
+
+    private func hasPrefix(_ chars: [Character], _ start: Int, _ prefix: String) -> Bool {
+        let p = Array(prefix)
+        guard start + p.count <= chars.count else { return false }
+        return Array(chars[start..<(start + p.count)]) == p
+    }
+
+    private func indexOf(_ chars: [Character], _ target: Character, from: Int) -> Int? {
+        var i = from
+        while i < chars.count {
+            if chars[i] == target { return i }
+            i += 1
+        }
+        return nil
+    }
+
+    // MARK: - 解析
+
+    private struct Parsed {
+        let inline: MDInline
+        let next: Int
+    }
+
+    /// `[![alt](img)](link)` → 可点击图片
+    private static func parseBadge(_ chars: [Character], start: Int) -> Parsed? {
+        guard start + 3 <= chars.count else { return nil }
+        // 跳到 alt 的结尾 ]
+        guard let altEnd = find(chars, "]", from: start + 3) else { return nil }
+        let alt = String(chars[(start + 3)..<altEnd])
+        guard altEnd + 1 < chars.count, chars[altEnd + 1] == "(" else { return nil }
+        guard let imgUrlEnd = find(chars, ")", from: altEnd + 2) else { return nil }
+        let imgURL = String(chars[(altEnd + 2)..<imgUrlEnd]).trimmingCharacters(in: .whitespaces)
+        guard imgUrlEnd + 1 < chars.count, chars[imgUrlEnd + 1] == "]" else { return nil }
+
+        // 后面可能还跟着 ](链接)
+        if imgUrlEnd + 2 < chars.count, chars[imgUrlEnd + 2] == "(",
+           let linkEnd = find(chars, ")", from: imgUrlEnd + 3) {
+            let link = String(chars[(imgUrlEnd + 3)..<linkEnd]).trimmingCharacters(in: .whitespaces)
+            let picture = MDInline.picture(url: imgURL,
+                                           alt: alt,
+                                           link: link.isEmpty ? nil : link)
+            return Parsed(inline: picture, next: linkEnd + 1)
+        }
+        return Parsed(inline: .picture(url: imgURL, alt: alt, link: nil), next: imgUrlEnd + 2)
+    }
+
+    /// `![alt](url)` → 图片
+    private static func parseImage(_ chars: [Character], start: Int) -> Parsed? {
+        let altStart = start + 2
+        guard let altEnd = find(chars, "]", from: altStart) else { return nil }
+        guard altEnd + 1 < chars.count, chars[altEnd + 1] == "(" else { return nil }
+        let urlStart = altEnd + 2
+        guard let urlEnd = findClosingParen(chars, from: urlStart) else { return nil }
+        let alt = String(chars[altStart..<altEnd])
+        let rawURL = String(chars[urlStart..<urlEnd])
+        guard let url = parseURLAndTitle(rawURL) else { return nil }
+        return Parsed(inline: .picture(url: url, alt: alt, link: nil), next: urlEnd + 1)
+    }
+
+    /// URL 可能带可选标题（`url "title"`），也可能虽然带空格但仍是合法地址
+    private static func parseURLAndTitle(_ body: String) -> String? {
+        var value = body.trimmingCharacters(in: .whitespaces)
+        guard !value.isEmpty else { return nil }
+        if let quote = value.firstIndex(of: "\""), quote != value.startIndex {
+            value = String(value[value.startIndex..<quote]).trimmingCharacters(in: .whitespaces)
+        }
+        if value.hasPrefix("<"), value.hasSuffix(">") {
+            value = String(value.dropFirst().dropLast())
+        }
+        return value.isEmpty ? nil : value
+    }
+
+    /// URL 里可能含括号（少数 shields 地址），按配对计数找真正的右括号
+    private static func findClosingParen(_ chars: [Character], from: Int) -> Int? {
+        var depth = 1
+        var i = from
+        while i < chars.count {
+            if chars[i] == "(" { depth += 1 }
+            if chars[i] == ")" {
+                depth -= 1
+                if depth == 0 { return i }
+            }
+            i += 1
+        }
+        return nil
+    }
+
+    private static func find(_ chars: [Character], _ target: Character, from: Int) -> Int? {
+        var i = from
+        while i < chars.count {
+            if chars[i] == target { return i }
+            i += 1
+        }
+        return nil
+    }
+
+    /// `<img src="..." alt="...">`
+    private static func parseHTMLImage(_ tag: String) -> MDInline? {
+        guard tag.lowercased().hasPrefix("<img") else { return nil }
+        guard let src = attribute(tag, "src") else { return nil }
+        let alt = attribute(tag, "alt") ?? ""
+        return .picture(url: src, alt: alt, link: nil)
+    }
+
+    private static func attribute(_ tag: String, _ name: String) -> String? {
+        guard let regex = try? NSRegularExpression(pattern: "\(name)\\s*=\\s*([\"'])(.*?)\\1",
+                                                  options: [.caseInsensitive]) else { return nil }
+        let range = NSRange(tag.startIndex..<tag.endIndex, in: tag)
+        guard let match = regex.firstMatch(in: tag, options: [], range: range),
+              match.numberOfRanges >= 3,
+              let valueRange = Range(match.range(at: 2), in: tag) else { return nil }
+        return String(tag[valueRange])
+    }
+}
+
 // MARK: - 内联样式
 
 enum MarkdownInline {
@@ -198,6 +405,19 @@ enum MarkdownInline {
 
         while index < text.endIndex {
             let remainder = text[index...]
+
+            // ***粗斜***
+            if remainder.hasPrefix("***") {
+                if let end = remainder.dropFirst(3).range(of: "***")?.lowerBound {
+                    let inner = remainder.dropFirst(3)[remainder.dropFirst(3).startIndex..<end]
+                    var piece = AttributedString(String(inner))
+                    piece.font = baseFont.bold().italic()
+                    piece.foregroundColor = baseColor
+                    attributed.append(piece)
+                    index = text.index(end, offsetBy: 3, limitedBy: text.endIndex) ?? text.endIndex
+                    continue
+                }
+            }
 
             if remainder.hasPrefix("**") {
                 if let end = remainder.dropFirst(2).range(of: "**")?.lowerBound {
@@ -225,7 +445,7 @@ enum MarkdownInline {
                 }
             }
 
-            if remainder.hasPrefix("[") || remainder.hasPrefix("![") {
+            if remainder.hasPrefix("[") {
                 if let link = parseLink(remainder) {
                     var piece = AttributedString(link.label)
                     piece.font = baseFont
@@ -250,13 +470,8 @@ enum MarkdownInline {
 
     private static func parseLink(_ slice: Substring) -> (label: String, url: String, next: String.Index)? {
         var work = slice
-        if work.hasPrefix("![") {
-            work = work.dropFirst(2)
-        } else if work.hasPrefix("[") {
-            work = work.dropFirst(1)
-        } else {
-            return nil
-        }
+        guard work.hasPrefix("[") else { return nil }
+        work = work.dropFirst(1)
         guard let closeBracket = work.firstIndex(of: "]") else { return nil }
         let label = String(work[work.startIndex..<closeBracket])
         let afterBracket = work.index(after: closeBracket)
@@ -273,12 +488,32 @@ enum MarkdownInline {
 struct MarkdownContentView: View {
     let markdown: String
 
+    /// 解析结果。**不能在 body 里同步 parse**：
+    /// 超长 README 会把主线程顶住，表现就是「点了返回没反应」。
+    @State private var blocks: [MDBlock] = []
+    @State private var parsed = false
+
     var body: some View {
-        let blocks = MarkdownParser.parse(markdown)
-        VStack(alignment: .leading, spacing: 12) {
-            ForEach(Array(blocks.enumerated()), id: \.offset) { _, block in
-                view(for: block)
+        Group {
+            if parsed {
+                VStack(alignment: .leading, spacing: 12) {
+                    ForEach(Array(blocks.enumerated()), id: \.offset) { _, block in
+                        view(for: block)
+                    }
+                }
+            } else {
+                // 解析期间先占位，保证导航随时可返回
+                SkeletonBlock(lines: 6)
             }
+        }
+        .task(id: markdown) {
+            let source = markdown
+            let result = await Task.detached(priority: .userInitiated) {
+                MarkdownParser.parse(source)
+            }.value
+            guard !Task.isCancelled else { return }
+            blocks = result
+            parsed = true
         }
     }
 
@@ -290,24 +525,19 @@ struct MarkdownContentView: View {
                 .font(headingFont(level))
                 .padding(.top, level <= 2 ? 6 : 2)
 
-        case .paragraph(let text):
-            Text(MarkdownInline.render(text, baseFont: .subheadline, baseColor: Theme.muted))
-                .font(.subheadline)
-                .fixedSize(horizontal: false, vertical: true)
+        case .paragraph(let segments):
+            MarkdownSegmentFlow(segments: segments, font: .subheadline, color: Theme.muted)
 
-        case .bullet(let text, let indent):
-            listRow(bullet: "•", text: text, indent: indent)
+        case .bullet(let segments, let indent):
+            listRow(bullet: "•", segments: segments, indent: indent)
 
-        case .ordered(let number, let text, let indent):
-            listRow(bullet: "\(number).", text: text, indent: indent, monospacedDigit: true)
+        case .ordered(let number, let segments, let indent):
+            listRow(bullet: "\(number).", segments: segments, indent: indent, monospacedDigit: true)
 
-        case .quote(let text):
+        case .quote(let segments):
             HStack(alignment: .top, spacing: 10) {
                 Rectangle().fill(Theme.border).frame(width: 3)
-                Text(MarkdownInline.render(text, baseFont: .subheadline, baseColor: Theme.subtle))
-                    .font(.subheadline)
-                    .italic()
-                    .fixedSize(horizontal: false, vertical: true)
+                MarkdownSegmentFlow(segments: segments, font: .subheadline, color: Theme.subtle, italic: true)
             }
             .fixedSize(horizontal: false, vertical: true)
 
@@ -328,9 +558,9 @@ struct MarkdownContentView: View {
                 }
             }
             .frame(maxWidth: .infinity, alignment: .leading)
-            .background(Theme.canvas, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+            .background(Theme.canvas, in: RoundedRectangle(cornerRadius: Theme.Radius.small, style: .continuous))
             .overlay {
-                RoundedRectangle(cornerRadius: 8, style: .continuous)
+                RoundedRectangle(cornerRadius: Theme.Radius.small, style: .continuous)
                     .stroke(Theme.border, lineWidth: 1)
             }
 
@@ -346,16 +576,14 @@ struct MarkdownContentView: View {
     }
 
     private func listRow(bullet: String,
-                         text: String,
+                         segments: [MDInline],
                          indent: Int,
                          monospacedDigit: Bool = false) -> some View {
         HStack(alignment: .top, spacing: 8) {
             Text(bullet)
                 .font(monospacedDigit ? .subheadline.monospacedDigit() : .subheadline)
                 .foregroundStyle(Theme.subtle)
-            Text(MarkdownInline.render(text, baseFont: .subheadline, baseColor: Theme.muted))
-                .font(.subheadline)
-                .fixedSize(horizontal: false, vertical: true)
+            MarkdownSegmentFlow(segments: segments, font: .subheadline, color: Theme.muted)
         }
         .padding(.leading, CGFloat(min(indent, 4)) * 14)
     }
@@ -363,7 +591,7 @@ struct MarkdownContentView: View {
     @ViewBuilder
     private func markdownImage(url: String, alt: String) -> some View {
         // README 里相对路径的图片没法直接加载，提示一下而不是留个空白
-        if let parsed = URL(string: url), parsed.scheme != nil {
+        if let target = resolveMarkdownURL(url), let parsed = URL(string: target) {
             AsyncImage(url: parsed) { phase in
                 switch phase {
                 case .success(let image):
@@ -373,21 +601,21 @@ struct MarkdownContentView: View {
                         .font(.caption)
                         .foregroundStyle(Theme.subtle)
                 default:
-                    RoundedRectangle(cornerRadius: 8)
+                    RoundedRectangle(cornerRadius: Theme.Radius.small)
                         .fill(Theme.border.opacity(0.3))
                         .frame(height: 140)
                         .overlay { ProgressView() }
                 }
             }
             .frame(maxWidth: .infinity)
-            .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+            .clipShape(RoundedRectangle(cornerRadius: Theme.Radius.small, style: .continuous))
         } else {
             Label(alt.isEmpty ? "README 内的相对路径图片" : "\(alt)（相对路径）", systemImage: "photo")
                 .font(.caption)
                 .foregroundStyle(Theme.subtle)
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .padding(10)
-                .background(Theme.canvas, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+                .background(Theme.canvas, in: RoundedRectangle(cornerRadius: Theme.Radius.small, style: .continuous))
         }
     }
 
@@ -401,9 +629,176 @@ struct MarkdownContentView: View {
     }
 }
 
+/// 行内序列的排版容器。
+///
+/// 纯文字时就是一个普通 `Text`；一旦混进图片（badge），
+/// 就换成自动换行的布局，让 badge 一个挨一个排好，而不是排成一条长线被裁掉。
+private struct MarkdownSegmentFlow: View {
+    let segments: [MDInline]
+    let font: Font
+    let color: Color
+    var italic: Bool = false
+
+    private var hasPicture: Bool {
+        segments.contains { if case .picture = $0 { return true }; return false }
+    }
+
+    var body: some View {
+        if !hasPicture {
+            let text = segments.compactMap { segment -> String? in
+                if case .text(let value) = segment { return value }
+                return nil
+            }.joined()
+            Text(MarkdownInline.render(text, baseFont: font, baseColor: color))
+                .font(font)
+                .italic(italic)
+                .fixedSize(horizontal: false, vertical: true)
+        } else {
+            FlowLayout(spacing: 4) {
+                ForEach(Array(segments.enumerated()), id: \.offset) { _, segment in
+                    switch segment {
+                    case .text(let value):
+                        if !value.trimmingCharacters(in: .whitespaces).isEmpty {
+                            Text(MarkdownInline.render(value, baseFont: font, baseColor: color))
+                                .font(font)
+                                .italic(italic)
+                        }
+                    case .picture(let url, let alt, let link):
+                        MarkdownBadge(url: url, alt: alt, link: link)
+                    }
+                }
+            }
+            .fixedSize(horizontal: false, vertical: true)
+        }
+    }
+}
+
+/// 内联 badge / 图片：限高以免撑破版面，加载失败就退回 alt 文字
+private struct MarkdownBadge: View {
+    let url: String
+    let alt: String
+    let link: String?
+
+    var body: some View {
+        if let target = resolveMarkdownURL(url), let parsed = URL(string: target) {
+            AsyncImage(url: parsed) { phase in
+                switch phase {
+                case .success(let image):
+                    image.resizable().scaledToFit()
+                case .failure:
+                    if !alt.isEmpty {
+                        Text(alt).font(.system(size: 11)).foregroundStyle(Theme.subtle)
+                    }
+                default:
+                    RoundedRectangle(cornerRadius: Theme.Radius.extraSmall)
+                        .fill(Theme.border.opacity(0.25))
+                        .frame(width: 56, height: 20)
+                }
+            }
+            .frame(maxHeight: 28)
+            .frame(maxWidth: 220)
+            .clipShape(RoundedRectangle(cornerRadius: Theme.Radius.extraSmall, style: .continuous))
+            .modifier(MarkdownBadgeLink(link: link))
+        } else if !alt.isEmpty {
+            Text(alt).font(.system(size: 11)).foregroundStyle(Theme.subtle)
+        }
+    }
+}
+
+/// badge 常带一个外链：点击能跳转就跳转，不能就保持普通展示
+private struct MarkdownBadgeLink: ViewModifier {
+    let link: String?
+
+    func body(content: Content) -> some View {
+        if let link, let url = URL(string: link), url.scheme != nil {
+            Link(destination: url) { content }
+        } else {
+            content
+        }
+    }
+}
+
+/// 极简自动换行布局：把子视图按行摆放，放不下就换行。
+/// SwiftUI 自带 `Layout` 协议，不需要第三方依赖。
+private struct FlowLayout: Layout {
+    var spacing: CGFloat = 4
+
+    func sizeThatFits(proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) -> CGSize {
+        let maxWidth = proposal.width ?? .infinity
+        var rowWidth: CGFloat = 0
+        var totalHeight: CGFloat = 0
+        var rowHeight: CGFloat = 0
+
+        for subview in subviews {
+            let size = subview.sizeThatFits(.unspecified)
+            if rowWidth > 0, rowWidth + spacing + size.width > maxWidth {
+                totalHeight += rowHeight + spacing
+                rowWidth = size.width
+                rowHeight = size.height
+            } else {
+                rowWidth += (rowWidth > 0 ? spacing : 0) + size.width
+                rowHeight = max(rowHeight, size.height)
+            }
+        }
+        totalHeight += rowHeight
+        return CGSize(width: maxWidth == .infinity ? rowWidth : maxWidth, height: totalHeight)
+    }
+
+    func placeSubviews(in bounds: CGRect, proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) {
+        var x = bounds.minX
+        var y = bounds.minY
+        var rowHeight: CGFloat = 0
+
+        for subview in subviews {
+            let size = subview.sizeThatFits(.unspecified)
+            if x > bounds.minX, x + size.width > bounds.maxX {
+                x = bounds.minX
+                y += rowHeight + spacing
+                rowHeight = 0
+            }
+            subview.place(at: CGPoint(x: x, y: y),
+                          anchor: .topLeading,
+                          proposal: ProposedViewSize(size))
+            x += size.width + spacing
+            rowHeight = max(rowHeight, size.height)
+        }
+    }
+}
+
+// MARK: - 表格
+
+/// 表格：先量宽，再统一绘制。
+///
+/// 旧实现每行各自 `frame(minWidth: 80, maxWidth: 220)`，内容长短不同列宽就不同，
+/// 于是「上下格没对齐」。正确做法是 ——
+/// 先按整列里最宽的那个单元格定出列宽，再让该列所有行都用这个宽度。
 private struct MarkdownTable: View {
-    let header: [String]
-    let rows: [[String]]
+    let header: [[MDInline]]
+    let rows: [[[MDInline]]]
+
+    private var columnCount: Int {
+        max(header.count, rows.map(\.count).max() ?? 0)
+    }
+
+    /// 每列统一的宽度：取整列里最宽单元格的估算宽度
+    private var columnWidths: [CGFloat] {
+        guard columnCount > 0 else { return [] }
+        var widths = [Int](repeating: 6, count: columnCount)
+
+        func measure(_ cells: [[MDInline]]) {
+            for (index, cell) in cells.enumerated() where index < columnCount {
+                let chars = visualLength(plainText(cell))
+                if chars > widths[index] { widths[index] = chars }
+            }
+        }
+        measure(header)
+        rows.forEach { measure($0) }
+
+        // 每字符约 7pt，再留出左右 padding；限制在合理区间
+        return widths.map { chars in
+            min(max(CGFloat(chars) * 7 + 24, 72), 260)
+        }
+    }
 
     var body: some View {
         ScrollView(.horizontal, showsIndicators: false) {
@@ -416,27 +811,56 @@ private struct MarkdownTable: View {
             }
             .background(Theme.surface)
             .overlay {
-                RoundedRectangle(cornerRadius: 8, style: .continuous)
+                RoundedRectangle(cornerRadius: Theme.Radius.small, style: .continuous)
                     .stroke(Theme.border, lineWidth: 1)
             }
-            .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+            .clipShape(RoundedRectangle(cornerRadius: Theme.Radius.small, style: .continuous))
         }
     }
 
-    private func row(_ cells: [String], isHeader: Bool) -> some View {
-        HStack(spacing: 0) {
-            ForEach(Array(cells.enumerated()), id: \.offset) { index, cell in
-                Text(MarkdownInline.render(cell,
-                                           baseFont: isHeader ? .footnote.bold() : .footnote,
-                                           baseColor: isHeader ? Theme.strongText : Theme.muted))
-                    .font(isHeader ? .footnote.bold() : .footnote)
-                    .frame(minWidth: 80, maxWidth: 220, alignment: .leading)
+    private func row(_ cells: [[MDInline]], isHeader: Bool) -> some View {
+        let widths = columnWidths
+        return HStack(spacing: 0) {
+            ForEach(0..<columnCount, id: \.self) { index in
+                let cell = index < cells.count ? cells[index] : []
+                MarkdownSegmentFlow(segments: cell,
+                                    font: isHeader ? .footnote.bold() : .footnote,
+                                    color: isHeader ? Theme.strongText : Theme.muted)
+                    .frame(width: widths[index], alignment: .leading)
                     .padding(.horizontal, 10)
                     .padding(.vertical, 7)
-                if index < cells.count - 1 {
+                if index < columnCount - 1 {
                     Rectangle().fill(Theme.border).frame(width: 0.5)
                 }
             }
         }
+        .frame(minHeight: 32, alignment: .center)
+        .background(isHeader ? Theme.canvas : Color.clear)
     }
+
+    /// 估算显示宽度：CJK 字符按 2 个宽度算，其余按 1
+    private func visualLength(_ text: String) -> Int {
+        text.unicodeScalars.reduce(0) { $0 + ($1.value > 0x2E80 ? 2 : 1) }
+    }
+
+    private func plainText(_ cells: [MDInline]) -> String {
+        cells.map { segment in
+            switch segment {
+            case .text(let value): return value
+            case .picture(_, let alt, _): return alt
+            }
+        }.joined()
+    }
+}
+
+/// README 里的图片地址常见几种形态，统一归一化：
+///  - `https://...` / `http://...` 直接用；
+///  - `//host/path` 补成 https；
+///  - 相对路径 / `data:` 没法直接加载，返回 nil 让它走占位提示。
+private func resolveMarkdownURL(_ url: String) -> String? {
+    let trimmed = url.trimmingCharacters(in: .whitespaces)
+    if trimmed.isEmpty { return nil }
+    if trimmed.hasPrefix("https://") || trimmed.hasPrefix("http://") { return trimmed }
+    if trimmed.hasPrefix("//") { return "https:" + trimmed }
+    return nil
 }

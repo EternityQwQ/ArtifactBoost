@@ -143,7 +143,7 @@ final class GitHubClient {
         return resp.artifacts
     }
 
-    /// 某个仓库的正式版（Release）
+    /// 某个仓库的发行版（Release）
     func releases(repo: GHRepo) async throws -> [GHRelease] {
         try await get("repos/\(repo.fullName)/releases", query: [
             URLQueryItem(name: "per_page", value: "50"),
@@ -169,7 +169,7 @@ final class GitHubClient {
             path = "repos/\(repo)/actions/artifacts/\(id)/zip"
         case .runLogs(let repo, let runID):
             path = "repos/\(repo)/actions/runs/\(runID)/logs"
-        case .releaseAsset(let repo, let assetID):
+        case .releaseAsset(let repo, let assetID, _):
             path = "repos/\(repo)/releases/assets/\(assetID)"
             // 附件接口默认返回 JSON 元数据，必须显式要二进制才会 302
             extraHeaders["Accept"] = "application/octet-stream"

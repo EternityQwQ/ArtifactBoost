@@ -27,6 +27,7 @@ final class DownloadManager: ObservableObject {
     @Published private(set) var items: [String: DownloadItem] = [:]
 
     private var engines: [String: DownloadEngine] = [:]
+    private var tasks: [String: Task<Void, Never>] = [:]
     private var backgroundTasks: [String: UIBackgroundTaskIdentifier] = [:]
 
     let session: SessionManager
@@ -88,7 +89,7 @@ final class DownloadManager: ObservableObject {
             }
         }
 
-        Task {
+        tasks[item.id] = Task {
             do {
                 let url = try await performDownload(item: item,
                                                     client: client,
@@ -104,17 +105,32 @@ final class DownloadManager: ObservableObject {
                 }
             }
             engines[item.id] = nil
+            tasks[item.id] = nil
             endBackgroundTask(for: item.id)
         }
     }
 
+    /// 取消下载。
+    ///
+    /// 三件事必须一起做，否则会出现「点了取消还要等很久才停」：
+    ///  1. `engine.cancel()` —— 掐断在飞的 URLSessionDataTask，让挂起的 await 立刻返回；
+    ///  2. `Task.cancel()` —— 唤醒下载协程本身；
+    ///  3. 立刻把状态改回 `.idle` —— 用户点完马上看到反馈，而不是等网络层慢慢收尾。
     func cancel(_ item: DownloadItem) {
         engines[item.id]?.cancel()
+        tasks[item.id]?.cancel()
+        tasks[item.id] = nil
+        engines[item.id] = nil
+        endBackgroundTask(for: item.id)
+        states[item.id] = .idle
     }
 
     func remove(_ item: DownloadItem) {
         engines[item.id]?.cancel()
+        tasks[item.id]?.cancel()
+        tasks[item.id] = nil
         engines[item.id] = nil
+        endBackgroundTask(for: item.id)
         states[item.id] = nil
         routeSummary[item.id] = nil
         items[item.id] = nil
@@ -189,15 +205,19 @@ final class DownloadManager: ObservableObject {
                      signedURL: URL,
                      settings: AccelerationSettings,
                      onProgress: @escaping @Sendable (DownloadProgress) -> Void) async throws -> URL {
+        // ghfast 这类镜像只认 github.com 原始地址，套签名地址会被拒，
+        // 所以「这条通道该套哪个 URL」必须逐条算，不能统一用 signedURL。
+        let githubURL = item.source.ghfastEligibleURL.flatMap { URL(string: $0) }
+
         var plan: [ScoredRoute]
         var note: String
 
-        if let saved = settings.savedPlan(isPrivateRepo: item.isPrivate) {
+        if let saved = settings.savedPlan(isPrivateRepo: item.isPrivate, githubURL: githubURL) {
             // 设置页已经测过速：直接用保存的最快通道
             plan = saved
             note = "\(saved[0].route.name)（设置页测速 \(formatSpeed(saved[0].speed))）"
         } else {
-            let candidates = settings.candidateRoutes(isPrivateRepo: item.isPrivate)
+            let candidates = settings.candidateRoutes(isPrivateRepo: item.isPrivate, githubURL: githubURL)
             if candidates.count <= 1 {
                 plan = [ScoredRoute(route: candidates[0], speed: 1)]
                 note = (item.isPrivate && settings.mode == .smart) ? "直连（私有仓库不走镜像）" : candidates[0].name
@@ -205,6 +225,7 @@ final class DownloadManager: ObservableObject {
                 routeSummary[item.id] = "正在测速选通道…"
                 let measured = await RouteProbe.measureAll(among: candidates,
                                                            signedURL: signedURL,
+                                                           githubURL: githubURL,
                                                            sampleLimit: item.size ?? RouteProbe.sampleBytes,
                                                            knownSize: item.size)
                 let fastest = measured.first?.speed ?? 0
@@ -216,7 +237,10 @@ final class DownloadManager: ObservableObject {
                     plan = viable
                     note = Self.describe(plan) + "（实测 \(formatSpeed(fastest))）"
                     if settings.mode == .smart, let best = measured.first {
-                        // 顺手把结果存下来，下次下载和设置页都能直接复用
+                        // 顺手把结果存下来，下次下载和设置页都能直接复用。
+                        // 注意 record() 是 mutating：必须落在一个 var 上，
+                        // 否则「写了个临时副本又丢掉」，下次还会重新测速。
+                        // record() 内部已经 save() 了。
                         var updated = settings
                         updated.record(route: best.route, speed: best.speed)
                     }
@@ -225,8 +249,11 @@ final class DownloadManager: ObservableObject {
         }
 
         let connections = settings.clampedConnections
+        // 逐条通道算出它该用的 URL：ghfast 用 github.com 地址，其余用签名地址
+        let routeURLs = Self.resolveRouteURLs(plan, signedURL: signedURL, githubURL: githubURL)
+
         do {
-            let result = try await engine.download(signedURL: signedURL,
+            let result = try await engine.download(routeURLs: routeURLs,
                                                    routes: plan,
                                                    fileName: item.fileName,
                                                    connections: connections,
@@ -237,7 +264,7 @@ final class DownloadManager: ObservableObject {
         } catch {
             // 通道可能失效/被限流，整体回退直连再试一次
             guard Self.shouldRetry(error), plan.contains(where: { !$0.route.isDirect }) else { throw error }
-            let result = try await engine.download(signedURL: signedURL,
+            let result = try await engine.download(routeURLs: [signedURL],
                                                    routes: [ScoredRoute(route: .direct, speed: 1)],
                                                    fileName: item.fileName,
                                                    connections: connections,
@@ -246,6 +273,27 @@ final class DownloadManager: ObservableObject {
             routeSummary[item.id] = "直连（\(note) 失败已回退） · 平均 \(formatSpeed(result.averageSpeed))"
             return result.fileURL
         }
+    }
+
+    /// 给每条通道算出实际请求的 URL。
+    ///
+    /// - `.githubOnly`（ghfast）：套 `https://github.com/...` 稳定地址；
+    ///   若这次下载没有稳定地址，就把这条通道剔掉（避免送上去必然 400）。
+    /// - 其余通道：套已签名的真实地址（原来的行为）。
+    private static func resolveRouteURLs(_ plan: [ScoredRoute],
+                                         signedURL: URL,
+                                         githubURL: URL?) -> [URL] {
+        let urls = plan.compactMap { scored -> URL? in
+            switch scored.route.scope {
+            case .any:
+                return scored.route.apply(to: signedURL)
+            case .githubOnly:
+                guard let githubURL else { return nil }
+                return scored.route.apply(to: githubURL)
+            }
+        }
+        // 全被剔掉（理论上不会，因为直连永远是 .any）时至少保底直连
+        return urls.isEmpty ? [signedURL] : urls
     }
 
     /// 通道描述，例如「多通道 gh-proxy.com + slink.ltd」

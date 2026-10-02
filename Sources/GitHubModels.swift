@@ -100,7 +100,7 @@ struct ArtifactsResponse: Codable {
     }
 }
 
-/// 正式版（Release）
+/// 发行版（Release）
 struct GHRelease: Codable, Identifiable, Hashable {
     let id: Int64
     let tagName: String

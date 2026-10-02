@@ -1,6 +1,6 @@
 import SwiftUI
 
-/// 正式版详情：附件 + 对应 tag 的源码包，都能加速下载
+/// 发行版详情：附件 + 对应 tag 的源码包，都能加速下载
 struct ReleaseDetailView: View {
     let repo: GHRepo
     let release: GHRelease
@@ -45,7 +45,7 @@ struct ReleaseDetailView: View {
             } header: {
                 Text("附件（\(release.assets.count)）")
             } footer: {
-                Text("正式版附件通常托管在 GitHub 的 CDN 上，同样支持多通道并发加速。")
+                Text("发行版附件通常托管在 GitHub 的 CDN 上，同样支持多通道并发加速。")
             }
 
             Section {
@@ -84,7 +84,7 @@ struct ReleaseDetailView: View {
                 } else if release.draft {
                     StatusPill(text: "草稿", color: Theme.muted)
                 } else {
-                    StatusPill(text: "正式版", color: Theme.green)
+                    StatusPill(text: "发行版", color: Theme.green)
                 }
             }
 

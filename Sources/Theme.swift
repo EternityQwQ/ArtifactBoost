@@ -22,8 +22,46 @@ extension Color {
     }
 }
 
-/// 视觉规范：配色与控件都对齐 GitHub 移动端
+/// 视觉规范：配色对齐 GitHub Primer，形状 / 字阶 / 间距对齐 Material Design 3。
+///
+/// Android 侧用 Compose 的 `Shapes` / `Typography` / `ColorScheme` 表达这套规范，
+/// iOS 这边没有 Material 运行时，所以把同一份 token 落成常量，
+/// 让两端在「圆角半径、字阶、间距节奏」上保持一致。
 enum Theme {
+
+    // MARK: - Material Design 3 形状 token
+    //
+    // 对应 Android `AppShapes`：
+    //   extraSmall 6 / small 10 / medium 14 / large 20 / extraLarge 28
+    enum Radius {
+        static let extraSmall: CGFloat = 6
+        static let small: CGFloat = 10
+        static let medium: CGFloat = 14
+        static let large: CGFloat = 20
+        static let extraLarge: CGFloat = 28
+        /// 胶囊（MD3 里用 Capsule 表达，这里是等价的「无限圆角」
+        static let full: CGFloat = 999
+    }
+
+    // MARK: - Material Design 3 间距节奏
+    //
+    // MD3 推荐 4pt 栅格：4 / 8 / 12 / 16 / 24 / 32。
+    // 之前各视图里散落着 10、14、18 这类「手感值」，
+    // 统一到栅格上之后，页面之间的呼吸感才一致。
+    enum Spacing {
+        static let xxs: CGFloat = 4
+        static let xs: CGFloat = 8
+        static let sm: CGFloat = 12
+        static let md: CGFloat = 16
+        static let lg: CGFloat = 24
+        static let xl: CGFloat = 32
+    }
+
+    /// MD3 侧边留白（对应 Android 的页面左右 16dp）
+    static let screenPadding: CGFloat = Spacing.md
+    /// 卡片内边距（对应 Android 的 14dp ≈ medium 形状档）
+    static let cardPadding: CGFloat = 14
+
     // MARK: - Primer 调色板
     static let blue = Color.adaptive(light: 0x0969DA, dark: 0x2F81F7)
     static let green = Color.adaptive(light: 0x1F883D, dark: 0x3FB950)
@@ -122,14 +160,14 @@ enum Theme {
 
 // MARK: - 通用控件
 
-/// 圆角图标（GitHub 移动端的仓库 / 文件图标风格）
+/// 圆角图标（MD3 的「filled tonal icon」视觉：淡色底 + 语义色图标）
 struct IconBadge: View {
     let systemName: String
     let color: Color
     var size: CGFloat = 34
 
     var body: some View {
-        RoundedRectangle(cornerRadius: size * 0.3, style: .continuous)
+        RoundedRectangle(cornerRadius: Theme.Radius.small, style: .continuous)
             .fill(color.opacity(0.12))
             .frame(width: size, height: size)
             .overlay {
@@ -140,20 +178,20 @@ struct IconBadge: View {
     }
 }
 
-/// 灰底小胶囊（GitHub 的 label / badge 风格）
+/// 灰底小胶囊（GitHub 的 label / badge 风格，形状走 MD3 full）
 struct StatusPill: View {
     let text: String
     let color: Color
     var systemImage: String?
 
     var body: some View {
-        HStack(spacing: 4) {
+        HStack(spacing: Theme.Spacing.xxs) {
             if let systemImage {
                 Image(systemName: systemImage).font(.system(size: 10, weight: .bold))
             }
             Text(text).font(.system(size: 11, weight: .semibold))
         }
-        .padding(.horizontal, 8)
+        .padding(.horizontal, Theme.Spacing.xs)
         .padding(.vertical, 3)
         .background(color.opacity(0.14), in: Capsule())
         .foregroundStyle(color)
@@ -165,7 +203,7 @@ struct LanguageLabel: View {
     let language: String
 
     var body: some View {
-        HStack(spacing: 4) {
+        HStack(spacing: Theme.Spacing.xxs) {
             Circle()
                 .fill(Theme.languageColor(language))
                 .frame(width: 9, height: 9)
@@ -197,7 +235,7 @@ struct EmptyStateView: View {
     let message: String?
 
     var body: some View {
-        VStack(spacing: 10) {
+        VStack(spacing: Theme.Spacing.sm) {
             Image(systemName: systemName)
                 .font(.system(size: 34, weight: .light))
                 .foregroundStyle(Theme.subtle)
@@ -212,30 +250,31 @@ struct EmptyStateView: View {
             }
         }
         .frame(maxWidth: .infinity)
-        .padding(.vertical, 32)
-        .padding(.horizontal, 24)
+        .padding(.vertical, Theme.Spacing.xl)
+        .padding(.horizontal, Theme.Spacing.lg)
         .listRowBackground(Color.clear)
     }
 }
 
-/// 卡片容器：浅色/深色下都有清晰边界（GitHub 的 box 风格）
+/// 卡片容器：MD3 outlined card —— 1pt 描边 + medium 圆角。
+/// 对齐 Android 侧的 `OutlinedCard`（`CardDefaults.outlinedCardColors` + 1dp border）。
 struct CardBackground: ViewModifier {
-    var padding: CGFloat = 14
+    var padding: CGFloat = Theme.cardPadding
 
     func body(content: Content) -> some View {
         content
             .padding(padding)
             .frame(maxWidth: .infinity, alignment: .leading)
-            .background(Theme.surface, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+            .background(Theme.surface, in: RoundedRectangle(cornerRadius: Theme.Radius.medium, style: .continuous))
             .overlay {
-                RoundedRectangle(cornerRadius: 12, style: .continuous)
+                RoundedRectangle(cornerRadius: Theme.Radius.medium, style: .continuous)
                     .stroke(Theme.border, lineWidth: 1)
             }
     }
 }
 
 extension View {
-    func card(padding: CGFloat = 14) -> some View {
+    func card(padding: CGFloat = Theme.cardPadding) -> some View {
         modifier(CardBackground(padding: padding))
     }
 }
@@ -244,7 +283,7 @@ struct ErrorBanner: View {
     let text: String
 
     var body: some View {
-        HStack(alignment: .top, spacing: 10) {
+        HStack(alignment: .top, spacing: Theme.Spacing.sm) {
             Image(systemName: "exclamationmark.triangle.fill")
                 .foregroundStyle(Theme.orange)
             Text(text)

@@ -1,12 +1,13 @@
 import SwiftUI
 
-/// 通用「可下载项」行：产物 / 构建日志 / 正式版附件 / 源码包 共用
+/// 通用「可下载项」行：产物 / 构建日志 / 发行版附件 / 源码包 共用
 struct DownloadItemRow: View {
     let item: DownloadItem
     var disabled: Bool = false
     var disabledNote: String?
 
     @EnvironmentObject private var downloads: DownloadManager
+    @State private var showDetails = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
@@ -15,6 +16,19 @@ struct DownloadItemRow: View {
         }
         .padding(.vertical, 4)
         .opacity(disabled ? 0.55 : 1)
+        .sheet(isPresented: $showDetails) {
+            // 边下边看：面板里的数据每次都从最新一帧进度里取，
+            // 所以重开面板看到的永远是「此刻」的明细。
+            DownloadDetailsView(title: item.title, diagnostics: currentDiagnostics)
+        }
+    }
+
+    /// 当前这一帧的分段明细（未在下载时为 nil）
+    private var currentDiagnostics: DownloadDiagnostics? {
+        if case .downloading(let progress) = downloads.state(for: item) {
+            return progress.diagnostics
+        }
+        return nil
     }
 
     private var header: some View {
@@ -105,6 +119,16 @@ struct DownloadItemRow: View {
                 }
 
                 HStack(spacing: 12) {
+                    Button {
+                        showDetails = true
+                    } label: {
+                        Label("详细信息", systemImage: "list.bullet.rectangle")
+                            .font(.caption)
+                    }
+                    .buttonStyle(.borderless)
+
+                    Spacer()
+
                     Button(role: .destructive) {
                         downloads.cancel(item)
                     } label: {
@@ -112,7 +136,6 @@ struct DownloadItemRow: View {
                             .font(.caption)
                     }
                     .buttonStyle(.borderless)
-                    Spacer()
                 }
             }
 

@@ -68,7 +68,7 @@ struct SearchView: View {
                 } else if results.isEmpty {
                     EmptyStateView(systemName: "magnifyingglass",
                                    title: keyword.isEmpty ? "搜索全站仓库" : "没有搜到「\(keyword)」",
-                                   message: "在顶部搜索框输入关键词后回车。公开仓库不需要你拥有它，能搜到就能下载它的产物、正式版和源码。")
+                                   message: "在顶部搜索框输入关键词后回车。公开仓库不需要你拥有它，能搜到就能下载它的产物、发行版和源码。")
                 } else {
                     Section {
                         ForEach(results) { repo in

@@ -34,7 +34,7 @@ struct LoginView: View {
             IconBadge(systemName: "bolt.horizontal.fill", color: Theme.blue, size: 64)
             Text("ArtifactBoost")
                 .font(.system(size: 24, weight: .bold))
-            Text("GitHub 产物 · 正式版 · 源码 · 构建日志\n多通道并发加速下载")
+            Text("GitHub 产物 · 发行版 · 源码 · 构建日志\n多通道并发加速下载")
                 .font(.footnote)
                 .multilineTextAlignment(.center)
                 .foregroundStyle(Theme.muted)
@@ -55,7 +55,7 @@ struct LoginView: View {
                     .autocorrectionDisabled()
                     .textContentType(.password)
                     .padding(12)
-                    .background(Color(.secondarySystemBackground), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+                    .background(Color(.secondarySystemBackground), in: RoundedRectangle(cornerRadius: Theme.Radius.small, style: .continuous))
 
                 VStack(alignment: .leading, spacing: 8) {
                     Link(destination: URL(string: "https://github.com/settings/tokens/new?scopes=repo&description=ArtifactBoost")!) {

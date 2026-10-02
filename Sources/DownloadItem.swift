@@ -9,11 +9,16 @@ enum ArchiveFormat: String, Hashable, Sendable {
     var title: String { self == .zip ? "ZIP" : "TAR.GZ" }
 }
 
-/// 能加速下载的东西：构建产物 / 构建日志 / 正式版附件 / 源码包
+/// 能加速下载的东西：构建产物 / 构建日志 / 发行版附件 / 源码包
 enum DownloadSource: Hashable, Sendable {
     case artifact(repo: String, id: Int64)
     case runLogs(repo: String, runID: Int64)
-    case releaseAsset(repo: String, assetID: Int64)
+    /// - Parameter browserURL: 该附件在 github.com 上的**稳定公开地址**
+    ///   （`https://github.com/{owner}/{repo}/releases/download/{tag}/{name}`）。
+    ///   镜像 ghfast.top 只认 `github.com` 域名，而解析出来的是 302 之后的 Azure
+    ///   签名地址，套不进 ghfast；有了这个稳定地址，发行版就能走 ghfast 加速。
+    ///   拿不到 tag 时为 nil，此时退回原行为（只用签名地址 + 常规镜像）。
+    case releaseAsset(repo: String, assetID: Int64, browserURL: String? = nil)
     case sourceArchive(repo: String, ref: String, format: ArchiveFormat)
 
     /// 源码包由 GitHub 现场打包，不支持 Range 分段，只能单连接下载
@@ -35,9 +40,17 @@ enum DownloadSource: Hashable, Sendable {
         switch self {
         case .artifact: return "构建产物"
         case .runLogs: return "构建日志"
-        case .releaseAsset: return "正式版附件"
+        case .releaseAsset: return "发行版附件"
         case .sourceArchive: return "源码包"
         }
+    }
+
+    /// 能否走 ghfast 这类**只认 github.com 原始地址**的镜像。
+    /// 目前只有发行版附件有这个稳定地址（构建产物/日志的地址是临时的）。
+    var ghfastEligibleURL: String? {
+        guard case .releaseAsset(_, _, let browserURL) = self,
+              let url = browserURL, !url.isEmpty else { return nil }
+        return url
     }
 }
 
@@ -101,15 +114,32 @@ extension DownloadItem {
     }
 
     static func releaseAsset(_ asset: GHReleaseAsset, release: GHRelease, repo: GHRepo) -> DownloadItem {
-        DownloadItem(
+        // 拼出 github.com 上的稳定下载地址，供 ghfast 这类镜像使用。
+        // 附件名可能含空格/中文，这里按路径段做一次编码。
+        let encodedTag = release.tagName.addingPercentEncoding(
+            withAllowedCharacters: Self.pathSegmentAllowed
+        ) ?? release.tagName
+        let encodedName = asset.name.addingPercentEncoding(
+            withAllowedCharacters: Self.pathSegmentAllowed
+        ) ?? asset.name
+        let browserURL = "https://github.com/\(repo.fullName)/releases/download/\(encodedTag)/\(encodedName)"
+
+        return DownloadItem(
             id: "asset-\(asset.id)",
             title: asset.name,
             subtitle: "\(release.displayName) · 下载 \(asset.downloadCount) 次",
             size: asset.size,
             isPrivate: repo.isPrivate,
-            source: .releaseAsset(repo: repo.fullName, assetID: asset.id)
+            source: .releaseAsset(repo: repo.fullName, assetID: asset.id, browserURL: browserURL)
         )
     }
+
+    /// URL 路径段允许的字符（保留非保留字符，其余交给百分号编码）
+    private static let pathSegmentAllowed: CharacterSet = {
+        var set = CharacterSet.urlPathAllowed
+        set.remove(charactersIn: "/?#[]@!$&'()*+,;=")
+        return set
+    }()
 
     static func sourceArchive(repo: GHRepo, ref: String, format: ArchiveFormat) -> DownloadItem {
         let label = ref.isEmpty ? (repo.defaultBranch ?? "默认分支") : ref
