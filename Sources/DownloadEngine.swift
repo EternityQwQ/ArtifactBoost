@@ -694,7 +694,10 @@ final class DownloadEngine: @unchecked Sendable {
         let sink = WriteSink(handle: handle)
 
         try await withThrowingTaskGroup(of: Void.self) { group in
-            var active = 0
+            // 并发计数：worker 结束时自己递减（见 addTask 闭包尾部）。
+            // 调度循环因此**绝不阻塞等待 worker 退出** —— 每一轮都能重新
+            // 尝试派活，worker 把尾部区间还回池子的瞬间，新 worker 就能补位。
+            let active = ConcurrencyCounter()
             var roundRobin = 0
 
             // 渐进建连：不再一上来就把 lanes 顶满。
@@ -719,7 +722,7 @@ final class DownloadEngine: @unchecked Sendable {
                 if downloaded != lastProgressBytes {
                     lastProgressBytes = downloaded
                     lastProgressAt = Date()
-                } else if active > 0, Date().timeIntervalSince(lastProgressAt) > 90 {
+                } else if active.current > 0, Date().timeIntervalSince(lastProgressAt) > 90 {
                     throw DownloadError.incomplete
                 }
 
@@ -733,7 +736,7 @@ final class DownloadEngine: @unchecked Sendable {
 
                 // 1) 把并发顶到「当前允许值」；通道被限流时按配额收缩
                 var assigned = false
-                while active < allowedLanes {
+                while active.current < allowedLanes {
                     // 此刻实际可用的并发额度：被限流的通道要临时降额，
                     // 免得在同一根已经饱和的线路上继续加压、越限越死。
                     let quota = channels.reduce(0) { partial, channel in
@@ -742,15 +745,14 @@ final class DownloadEngine: @unchecked Sendable {
                         }
                         return partial + perChannelQuota
                     }
-                    if active >= quota { break }
+                    if active.current >= quota { break }
 
-                    guard let work = nextWork(pool: pool, live: active, lanes: lanes, total: total) else { break }
+                    guard let work = nextWork(pool: pool, live: active.current, lanes: lanes, total: total) else { break }
                     let channelIndex = pickChannel(channels, roundRobin: roundRobin)
                     let channel = channels[channelIndex]
                     roundRobin = (roundRobin + 1) % channels.count
 
                     let laneId = laneCounter.next()
-                    board.bumpTotalSlice()
                     // 先登记一条 pending，让面板立刻能看到「这条车道已就位」
                     board.update(LaneSnapshot(laneId: laneId,
                                               routeName: channel.name,
@@ -763,7 +765,7 @@ final class DownloadEngine: @unchecked Sendable {
                                               attempt: 1,
                                               lastStatus: nil))
 
-                    active += 1
+                    active.increment()
                     assigned = true
                     group.addTask { [self] in
                         await runSlice(laneId: laneId,
@@ -776,14 +778,18 @@ final class DownloadEngine: @unchecked Sendable {
                                        accumulator: accumulator,
                                        board: board)
                         board.remove(laneId)
+                        // worker 自己结算并发名额：调度循环永远不需要
+                        // 阻塞收割（group.next() 等一个 worker 干到退出
+                        // 才返回 —— 那会让整条下载退化成单连接）
+                        active.decrement()
                     }
                 }
 
-                if active == 0 { break }
-
-                // 2) 收一个完成的任务，腾出并发名额
-                _ = try await group.next()
-                active -= 1
+                // 2) 完成判定：所有 worker 都收工、且池子里再也切不出新活儿
+                if active.current == 0,
+                   nextWork(pool: pool, live: 0, lanes: lanes, total: total) == nil {
+                    break
+                }
 
                 // 3) 没活儿可派：等一小会儿再评估，别忙等烧 CPU。
                 // 这个分支每多睡一次，就是在「明明还能切分尾部、却白白空等」
@@ -842,6 +848,11 @@ final class DownloadEngine: @unchecked Sendable {
                 board.bumpSplit()
             }
             current = Chunk(start: from, end: to)
+
+            // 每真正派发一片就记一笔，让「完成 / 累计」两个数对得上
+            //（放 worker 里而不是 spawn 处：worker 会自己续做几十片，
+            //  只记 spawn 数的话「累计」会远小于「完成」）
+            board.bumpTotalSlice()
 
             // 派活前先更新看板：面板能立刻看到这条车道换到了哪一段
             board.update(LaneSnapshot(laneId: laneId,
@@ -1312,6 +1323,23 @@ private final class Counter: @unchecked Sendable {
         let current = value
         value += 1
         return current
+    }
+}
+
+/// 并发计数器：worker 结束时自己递减，调度循环只读。
+/// 这样调度器**永远不需要阻塞等待某个 worker 退出** ——
+/// 阻塞收割（group.next()）正是「整条下载退化成单连接」的元凶：
+/// 调度器 spawn 了 1 条 worker 后区间就在它手里，池子是空的，
+/// 阻塞收割会让调度器一直等到这条 worker 干完整个下载才醒。
+private final class ConcurrencyCounter: @unchecked Sendable {
+    private let lock = NSLock()
+    private var value = 0
+
+    func increment() { lock.lock(); value += 1; lock.unlock() }
+    func decrement() { lock.lock(); value -= 1; lock.unlock() }
+    var current: Int {
+        lock.lock(); defer { lock.unlock() }
+        return value
     }
 }
 
