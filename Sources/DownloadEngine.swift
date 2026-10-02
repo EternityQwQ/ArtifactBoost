@@ -79,6 +79,8 @@ enum DownloadError: LocalizedError, Equatable {
     case badResponse
     case cancelled
     case incomplete
+    /// 服务器忽略 Range 头（回 200 全量）：这条地址不能用于分段下载
+    case noRangeSupport
     /// 服务器明确要求我们慢一点（429 / 503 等），需要按 Retry-After 退避
     case throttled(code: Int, retryAfter: TimeInterval?)
 
@@ -87,13 +89,15 @@ enum DownloadError: LocalizedError, Equatable {
         case .badResponse: return "下载失败：服务器响应异常"
         case .cancelled: return "下载已取消"
         case .incomplete: return "下载失败：数据校验不通过（可能断流），请重试"
+        case .noRangeSupport: return "下载失败：该通道不支持分段下载"
         case .throttled(let code, _): return "下载失败：服务器限流（\(code)）"
         }
     }
 
     static func == (lhs: DownloadError, rhs: DownloadError) -> Bool {
         switch (lhs, rhs) {
-        case (.badResponse, .badResponse), (.cancelled, .cancelled), (.incomplete, .incomplete):
+        case (.badResponse, .badResponse), (.cancelled, .cancelled), (.incomplete, .incomplete),
+             (.noRangeSupport, .noRangeSupport):
             return true
         case let (.throttled(a, _), .throttled(b, _)):
             return a == b
@@ -700,9 +704,24 @@ final class DownloadEngine: @unchecked Sendable {
             var allowedLanes = min(Self.rampStep(for: lanes), lanes)
             var lastRampAt = Date()
 
+            // 无进展保护：所有 worker 都在「失败→重派→再失败」里空转、
+            // 文件一个字节都没涨，这种状态持续 90 秒就判定全线失败。
+            // 没有它，全线断网/磁盘写挂时调度器会永远空转下去。
+            var lastProgressBytes = pool.downloaded()
+            var lastProgressAt = Date()
+
             while true {
                 // 取消后立刻退出调度循环，不再派新活儿
                 if isCancelled || inflight.isCancelling { break }
+
+                // 无进展保护（worker 失败时是让位退出而不是抛错，全靠这里兜底）
+                let downloaded = pool.downloaded()
+                if downloaded != lastProgressBytes {
+                    lastProgressBytes = downloaded
+                    lastProgressAt = Date()
+                } else if active > 0, Date().timeIntervalSince(lastProgressAt) > 90 {
+                    throw DownloadError.incomplete
+                }
 
                 // 0) 建连爬坡：到点就放开一档并发
                 let now = Date()
@@ -886,7 +905,10 @@ final class DownloadEngine: @unchecked Sendable {
                 // 失败的那一段必须还回池子，否则文件会缺一块
                 pool.putBack(Chunk(start: from, end: to))
 
-                sink.markFailed()
+                // 注意不要 markFailed：那是给「磁盘写失败」用的，
+                // 网络重试耗尽只是这一片失败 —— 写盘要是被标记 failed，
+                // 后面所有 worker 写的数据都会被静默丢弃，文件直接损坏。
+                // 让位退出即可，调度器会派新 worker 继续吃池子里的区间。
                 return
             }
 
@@ -950,6 +972,9 @@ final class DownloadEngine: @unchecked Sendable {
                             laneId: Int,
                             channel: RouteChannel) async throws -> SliceOutcome {
         var lastError: Error = DownloadError.badResponse
+        // 限流撞了两回就直接放弃这一片：继续退避 = 攥着区间干等，
+        // 整条下载都陪着这条被限流的通道停摆。让位给调度器重新派。
+        var throttledCount = 0
 
         for attempt in 0..<Self.maxAttempts {
             // 每轮重试前先看有没有被取消
@@ -967,10 +992,21 @@ final class DownloadEngine: @unchecked Sendable {
                 guard let http = response as? HTTPURLResponse else { throw DownloadError.badResponse }
 
                 switch http.statusCode {
-                case 200, 206:
+                case 206:
                     channel.setThrottled(false)
                     guard !data.isEmpty else { throw DownloadError.incomplete }
                     return SliceOutcome(data: data, elapsed: Date().timeIntervalSince(startedAt))
+                case 200:
+                    // 服务器忽略了 Range（回 200 全量）。这多半意味着这条地址
+                    // 不支持分段：交给重试逻辑换备用地址。
+                    // 唯一能救的是 start==0 的片 —— 数据本来就是从 0 开始的，
+                    // 截取前 want 字节照样是对的（URLSession 已把整个响应读进来，
+                    // prefix 只是截取引用段，不会二次拷贝整个文件）。
+                    guard chunk.start == 0 else { throw DownloadError.noRangeSupport }
+                    channel.setThrottled(false)
+                    let head = data.prefix(Int(chunk.length))
+                    guard head.count > 0 else { throw DownloadError.incomplete }
+                    return SliceOutcome(data: Data(head), elapsed: Date().timeIntervalSince(startedAt))
                 case 429, 503:
                     pool.recordThrottle()
                     board.bumpThrottle()
@@ -994,9 +1030,23 @@ final class DownloadEngine: @unchecked Sendable {
                 board.bumpRetry()
                 if attempt >= Self.maxAttempts - 1 { break }
 
+                // 不支持 Range 的地址：换下一个立刻重试，不退避 —— 这是地址选错了，
+                // 不是服务器忙（attempt 照常消耗，单地址轮到自己时也能正常退出）
+                if (error as? DownloadError) == .noRangeSupport {
+                    channel.rotate()
+                    continue
+                }
+
                 if case .throttled(_, _) = (error as? DownloadError) {
                     // 被限流：把这条通道的权重降下来，让活儿分给别人
                     channel.demote()
+                    throttledCount += 1
+                    if throttledCount >= 2 {
+                        // 连着两次限流：这条通道眼下进不去，别攥着区间长睡，
+                        // 直接放弃这一片 —— 调度器马上会把活儿派给健康通道。
+                        pool.recordFailure()
+                        throw error
+                    }
                 }
                 if attempt >= 1 { channel.rotate() }
 
@@ -1153,7 +1203,7 @@ final class DownloadEngine: @unchecked Sendable {
     private static let userAgent = "ArtifactBoost"
 
     /// 引擎并发上限（与 AccelerationSettings.maxConnections 一致）
-    private static let maxLanes = 512
+    private static let maxLanes = 128
 
     /// 把 fd soft limit 提到 hard 上限：每条连接占一个 fd，
     /// 并发放开到 128+ 之后，默认 soft limit（常见 256）会在建连一半时报
@@ -1189,12 +1239,14 @@ final class DownloadEngine: @unchecked Sendable {
         return seconds
     }
 
-    /// 指数退避 + 抖动；限流时优先听服务端的 Retry-After
+    /// 指数退避 + 抖动；限流时优先听服务端的 Retry-After。
+    /// 限流退避上限压到 1.5s：worker 命中限流后要么很快回来、要么直接让位，
+    /// 绝不攥着区间长睡 —— 一次 Retry-After: 600 的限流不该让整条下载停十分钟。
     private static func backoffMillis(attempt: Int, error: Error) -> Int {
         if case .throttled(_, let retryAfter) = (error as? DownloadError) {
             // 防雪崩：多个 worker 同时被限流时把退避时间错开
             let base = retryAfter ?? Double(1 << min(attempt, 4))
-            return Int(min(max(base * (1 + Double.random(in: 0...0.25)), 0.25), 30) * 1000)
+            return Int(min(max(base * (1 + Double.random(in: 0...0.25)), 0.25), 1.5) * 1000)
         }
         let base = Double(1 << min(attempt, 5)) * 250
         return Int(min(base * (1 + Double.random(in: 0...0.3)), 15_000))

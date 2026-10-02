@@ -113,12 +113,12 @@ struct AccelerationSettings {
     var testedAt: Date?
 
     static let `default` = AccelerationSettings()
-    /// 前 4 档是常规区间，后 3 档是极限档（UI 上分两行展示）。
-    /// 极限档：吃千兆内网/高速 Wi-Fi 用，普通宽带大概率吃不满，
-    /// 且更容易被 CDN 限流（引擎会自动退避降速，不会失败）。
-    static let connectionOptions = [8, 16, 32, 64, 128, 256, 512]
+    /// 设置页档位
+    /// 128 属于极限档：吃千兆内网/高速 Wi-Fi 用，普通宽带吃不满，
+    /// 且更容易被 CDN 限流（引擎会自动退让，不会失败）。
+    static let connectionOptions = [8, 16, 32, 64, 128]
     /// 引擎接受的并发上限
-    static let maxConnections = 512
+    static let maxConnections = 128
 
     private enum Keys {
         static let connections = "ab.connections"

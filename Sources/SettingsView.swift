@@ -71,22 +71,12 @@ struct SettingsView: View {
 
     private var accelerationSection: some View {
         Section {
-            // 7 个档位一行放不下，拆两行：常规档 + 极限档（两个 Picker 绑同一个 selection）
-            VStack(spacing: Theme.Spacing.xs) {
-                Picker("并发连接数", selection: connectionsBinding) {
-                    ForEach(AccelerationSettings.connectionOptions.prefix(4), id: \.self) { count in
-                        Text("\(count)").tag(count)
-                    }
+            Picker("并发连接数", selection: connectionsBinding) {
+                ForEach(AccelerationSettings.connectionOptions, id: \.self) { count in
+                    Text("\(count)").tag(count)
                 }
-                .pickerStyle(.segmented)
-
-                Picker("并发连接数-极限档", selection: connectionsBinding) {
-                    ForEach(AccelerationSettings.connectionOptions.dropFirst(4), id: \.self) { count in
-                        Text("\(count)").tag(count)
-                    }
-                }
-                .pickerStyle(.segmented)
             }
+            .pickerStyle(.segmented)
 
             Picker("下载通道", selection: modeBinding) {
                 ForEach(RouteMode.allCases) { mode in
@@ -112,7 +102,7 @@ struct SettingsView: View {
         } footer: {
             VStack(alignment: .leading, spacing: 6) {
                 Text(settings.mode.detail)
-                Text("并发数越大越能跑满带宽；绿色网络环境建议 32~64，一般 16 即可。128 以上属于极限档：适合千兆内网/高速 Wi-Fi，普通宽带吃不满，且更容易被 CDN 限流（引擎会自动退避降速，不会失败）。设置会自动保存，下载时直接生效。")
+                Text("并发数越大越能跑满带宽；绿色网络环境建议 32~64，一般 16 即可，千兆内网/高速 Wi-Fi 可试 128。被限流时引擎会自动退让并把活儿转给健康通道，不会失败。设置会自动保存，下载时直接生效。")
                 if settings.mode == .smart {
                     Text("智能加速会额外尝试 ghfast.top —— 它只认 github.com 原始地址，因此**仅对发行版（Release）附件生效**，构建产物与日志仍走其它镜像。")
                 }
