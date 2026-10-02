@@ -135,10 +135,16 @@ struct AccelerationSettings {
         }
     }
 
-    /// 可以直接沿用的测速结果（24 小时内有效、且不在私有仓库里用镜像）
+    /// 下载开始时**直接沿用**测速结果的有效期。
+    ///
+    /// 老实现是 24 小时：一条早上测出来的「快通道」到了晚上可能早就被限流，
+    /// 结果下载起步看着还行、很快掉到几十 KB。现在超过这个时长就重新测速。
+    static let savedPlanValidInterval: TimeInterval = 4 * 3600
+
+    /// 可以直接沿用的测速结果（有效期内、且不在私有仓库里用镜像）
     func savedPlan(isPrivateRepo: Bool) -> [ScoredRoute]? {
         guard let route = testedRoute, let testedAt else { return nil }
-        guard Date().timeIntervalSince(testedAt) < 24 * 3600 else { return nil }
+        guard Date().timeIntervalSince(testedAt) < Self.savedPlanValidInterval else { return nil }
         guard !(isPrivateRepo && !route.isDirect) else { return nil }
         guard candidateRoutes(isPrivateRepo: isPrivateRepo).contains(route) else { return nil }
         return [ScoredRoute(route: route, speed: max(testedSpeed, 0.01))]
@@ -155,9 +161,10 @@ struct AccelerationSettings {
 
 /// 通道测速：每个通道各拉一小段数据，取最快的那条
 enum RouteProbe {
-    /// 采样 256KB：快通道 0.1~0.5s 出结果，慢通道也不会拖太久
-    static let sampleBytes: Int64 = 256 * 1024
-    static let timeout: TimeInterval = 6
+    /// 采样 512KB，并从文件中部取样 —— 长链路上开头几个包要经历 TCP 慢启动，
+    /// 只测开头会把所有通道都测成同一个烂数，选出来的「最快通道」等于抽签。
+    static let sampleBytes: Int64 = 512 * 1024
+    static let timeout: TimeInterval = 8
 
     /// 探测专用会话：限制总时长，防止某个通道不认 Range 时把整个文件都拉进内存
     private static let session: URLSession = {
@@ -168,13 +175,16 @@ enum RouteProbe {
     }()
 
     /// 并发测量所有通道，返回按速度从快到慢排序的结果（失败的通道会被丢掉）
+    ///
+    /// - Parameter knownSize: 已知体积时从文件中段取样，避开 TCP 慢启动
     static func measureAll(among routes: [DownloadRoute],
                            signedURL: URL,
-                           sampleLimit: Int64 = sampleBytes) async -> [ScoredRoute] {
+                           sampleLimit: Int64 = sampleBytes,
+                           knownSize: Int64? = nil) async -> [ScoredRoute] {
         let limit = max(64 * 1024, min(sampleLimit, sampleBytes))
         let results = await withTaskGroup(of: ScoredRoute?.self) { group in
             for route in routes {
-                group.addTask { await measure(route: route, signedURL: signedURL, limit: limit) }
+                group.addTask { await measure(route: route, signedURL: signedURL, limit: limit, knownSize: knownSize) }
             }
             var collected: [ScoredRoute] = []
             for await result in group {
@@ -185,11 +195,19 @@ enum RouteProbe {
         return results.sorted { $0.speed > $1.speed }
     }
 
-    static func measure(route: DownloadRoute, signedURL: URL, limit: Int64 = sampleBytes) async -> ScoredRoute? {
+    static func measure(route: DownloadRoute,
+                        signedURL: URL,
+                        limit: Int64 = sampleBytes,
+                        knownSize: Int64? = nil) async -> ScoredRoute? {
+        // 已知体积就从中间取样，避开慢启动
+        let offset: Int64 = {
+            guard let knownSize, knownSize > limit * 3 else { return 0 }
+            return (knownSize - limit) / 2
+        }()
         var request = URLRequest(url: route.apply(to: signedURL))
         request.cachePolicy = .reloadIgnoringLocalCacheData
         request.timeoutInterval = timeout
-        request.setValue("bytes=0-\(limit - 1)", forHTTPHeaderField: "Range")
+        request.setValue("bytes=\(offset)-\(offset + limit - 1)", forHTTPHeaderField: "Range")
 
         let start = Date()
         guard let (data, response) = try? await session.data(for: request),

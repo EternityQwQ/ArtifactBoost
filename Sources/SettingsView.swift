@@ -242,7 +242,7 @@ struct SettingsView: View {
             candidates = [.direct]
         }
 
-        let measured = await RouteProbe.measureAll(among: candidates, signedURL: target.url)
+        let measured = await RouteProbe.measureAll(among: candidates, signedURL: target.url, knownSize: target.size)
         testResults = measured
 
         guard let best = measured.first else {

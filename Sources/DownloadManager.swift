@@ -6,6 +6,8 @@ struct SpeedTestTarget {
     let url: URL
     let label: String
     let isPrivate: Bool
+    /// 已知体积：测速时从文件中部取样，避开 TCP 慢启动
+    var size: Int64? = nil
 }
 
 @MainActor
@@ -146,7 +148,8 @@ final class DownloadManager: ObservableObject {
                let url = try? await client.resolveDownloadURL(for: .artifact(repo: repo.fullName, id: artifact.id)) {
                 return SpeedTestTarget(url: url,
                                        label: "\(repo.name) · \(artifact.name)",
-                                       isPrivate: repo.isPrivate)
+                                       isPrivate: repo.isPrivate,
+                                       size: artifact.sizeInBytes)
             }
             if let url = try? await client.resolveDownloadURL(for: .runLogs(repo: repo.fullName, runID: run.id)) {
                 return SpeedTestTarget(url: url, label: "\(repo.name) · 构建日志", isPrivate: repo.isPrivate)
@@ -202,7 +205,8 @@ final class DownloadManager: ObservableObject {
                 routeSummary[item.id] = "正在测速选通道…"
                 let measured = await RouteProbe.measureAll(among: candidates,
                                                            signedURL: signedURL,
-                                                           sampleLimit: item.size ?? RouteProbe.sampleBytes)
+                                                           sampleLimit: item.size ?? RouteProbe.sampleBytes,
+                                                           knownSize: item.size)
                 let fastest = measured.first?.speed ?? 0
                 let viable = measured.filter { $0.speed >= fastest * 0.4 }
                 if viable.isEmpty {
@@ -226,6 +230,7 @@ final class DownloadManager: ObservableObject {
                                                    routes: plan,
                                                    fileName: item.fileName,
                                                    connections: connections,
+                                                   allowChunking: item.source.supportsChunkedDownload,
                                                    progress: onProgress)
             routeSummary[item.id] = "\(note) · 平均 \(formatSpeed(result.averageSpeed))"
             return result.fileURL
@@ -236,6 +241,7 @@ final class DownloadManager: ObservableObject {
                                                    routes: [ScoredRoute(route: .direct, speed: 1)],
                                                    fileName: item.fileName,
                                                    connections: connections,
+                                                   allowChunking: item.source.supportsChunkedDownload,
                                                    progress: onProgress)
             routeSummary[item.id] = "直连（\(note) 失败已回退） · 平均 \(formatSpeed(result.averageSpeed))"
             return result.fileURL
