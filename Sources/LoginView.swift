@@ -30,8 +30,12 @@ struct LoginView: View {
     }
 
     private var hero: some View {
-        VStack(spacing: 10) {
-            IconBadge(systemName: "bolt.horizontal.fill", color: Theme.blue, size: 64)
+        VStack(spacing: Theme.Spacing.sm) {
+            // 用真实的应用图标（双闪电品牌图形），而不是通用闪电字形
+            Image("BrandMark")
+                .resizable()
+                .scaledToFit()
+                .frame(height: 72)
             Text("ArtifactBoost")
                 .font(.system(size: 24, weight: .bold))
             Text("GitHub 产物 · 发行版 · 源码 · 构建日志\n多通道并发加速下载")
