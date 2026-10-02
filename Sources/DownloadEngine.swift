@@ -121,6 +121,7 @@ private struct Chunk: Sendable {
 private final class SlicePool: @unchecked Sendable {
     private let lock = NSLock()
     private var queue: [Chunk] = []
+    private let total: Int64
 
     /// 每次「把末尾区间砍一刀」记一笔
     private(set) var splits = 0
@@ -135,6 +136,7 @@ private final class SlicePool: @unchecked Sendable {
     }
 
     init(total: Int64) {
+        self.total = total
         queue = [Chunk(start: 0, end: total - 1)]
     }
 
@@ -158,12 +160,14 @@ private final class SlicePool: @unchecked Sendable {
     /// 取一段活儿；没有就返回 nil，由调度循环决定要不要切分
     func take() -> Chunk? {
         lock.lock(); defer { lock.unlock() }
-        return queue.isEmpty ? nil : queue.removeFirst()
+        let chunk = queue.isEmpty ? nil : queue.removeFirst()
+        checkInvariantsLocked()
+        return chunk
     }
 
     /// 把没下完的区间还回队列最前面
     func putBack(_ chunk: Chunk) {
-        lock.lock(); queue.insert(chunk, at: 0); lock.unlock()
+        lock.lock(); queue.insert(chunk, at: 0); checkInvariantsLocked(); lock.unlock()
     }
 
     /// 池子空了、但还有连接闲着时调用：从队列末尾挑一段砍成两半
@@ -173,12 +177,39 @@ private final class SlicePool: @unchecked Sendable {
         guard let victim = queue.popLast() else { return nil }
         guard victim.length > Int64(target) else {
             queue.append(victim)
+            checkInvariantsLocked()
             return nil
         }
         let half = victim.length / 2
         queue.append(Chunk(start: victim.start + half, end: victim.end))
         splits += 1
+        checkInvariantsLocked()
         return Chunk(start: victim.start, end: victim.start + half - 1)
+    }
+
+    /// 区间所有权不变量自检（仅 Debug 构建生效，Release 下函数体被优化掉）。
+    ///
+    /// 校验两件事：
+    ///  1. 池内所有区间两两不重叠 —— 一旦重叠，两个 worker 会下同一段、重复写盘；
+    ///  2. 所有区间都落在 `[0, total)` 内 —— 越界写会直接损坏文件。
+    ///
+    /// 这条断言就是为「派发总字节超过文件体积」那个 bug 加的防线：
+    /// 以后谁再动调度逻辑，测试没覆盖到的地方也能在 Debug 跑挂暴露出来。
+    /// 调用方必须已持有 `lock`。
+    private func checkInvariantsLocked() {
+        #if DEBUG
+        var prevEnd: Int64 = -1
+        for chunk in queue.sorted(by: { $0.start < $1.start }) {
+            assert(chunk.start >= 0 && chunk.start < total,
+                   "区间起点越界: \(chunk.start) 不在 [0, \(total))")
+            assert(chunk.end >= 0 && chunk.end < total,
+                   "区间终点越界: \(chunk.end) 不在 [0, \(total))")
+            assert(chunk.start <= chunk.end, "区间非法: \(chunk.start) > \(chunk.end)")
+            assert(chunk.start > prevEnd,
+                   "区间重叠: 上一段结束于 \(prevEnd)，这一段却从 \(chunk.start) 开始")
+            prevEnd = chunk.end
+        }
+        #endif
     }
 }
 
@@ -731,9 +762,11 @@ final class DownloadEngine: @unchecked Sendable {
                 _ = try await group.next()
                 active -= 1
 
-                // 3) 没活儿可派：等一小会儿再评估，别忙等烧 CPU
+                // 3) 没活儿可派：等一小会儿再评估，别忙等烧 CPU。
+                // 这个分支每多睡一次，就是在「明明还能切分尾部、却白白空等」
+                // 的时间上加一笔，所以窗口收紧到 60ms。
                 if !assigned {
-                    try await Task.sleep(for: .milliseconds(40))
+                    try await Task.sleep(for: .milliseconds(60))
                 }
             }
             // 取消时把还在跑的子任务一起掐掉，别让它们继续占用连接
@@ -771,16 +804,21 @@ final class DownloadEngine: @unchecked Sendable {
             if Task.isCancelled { return }
 
             let remaining = max(total - pool.downloaded(), 0)
-            let want = min(sliceTarget(lanes: lanes, total: total, remaining: remaining),
-                           Int(current.length))
+            let want = max(1, min(sliceTarget(lanes: lanes, total: total, remaining: remaining),
+                                  Int(current.length)))
             let from = current.start
             let to = from + Int64(want) - 1
 
-            if Int64(want) < current.length {
-                // 手里这段太长：只取前一小片，剩下的还回去让别的连接分
+            if to < current.end {
+                // 手里这段比一小片长：把「剩下的」还回池子。
+                // 还回去之后必须立刻放弃对它的所有权 —— 也就是把 current
+                // 收窄成刚切出来的这一小片，绝不再引用后半段。
+                // 否则同一段字节会同时存在于池子和这个 worker 手上，
+                // 池子再把它派给别人，两个 worker 就会下到重叠区间、重复写盘。
                 pool.putBack(Chunk(start: to + 1, end: current.end))
                 board.bumpSplit()
             }
+            current = Chunk(start: from, end: to)
 
             // 派活前先更新看板：面板能立刻看到这条车道换到了哪一段
             board.update(LaneSnapshot(laneId: laneId,
@@ -842,28 +880,34 @@ final class DownloadEngine: @unchecked Sendable {
                                           attempt: Self.maxAttempts,
                                           lastStatus: { if case let .throttled(code, _) = (error as? DownloadError) { return code }; return nil }()))
                 // 失败的那一段必须还回池子，否则文件会缺一块
-                pool.putBack(Chunk(start: from, end: current.end))
+                pool.putBack(Chunk(start: from, end: to))
 
                 sink.markFailed()
                 return
             }
 
-            if to >= current.end {
-                // 手里这段干完了，再要一段；要不到就收工
-                guard let next = nextWork(pool: pool, live: 0, lanes: lanes, total: total) else { return }
-                current = next
-            } else {
-                current = Chunk(start: to + 1, end: current.end)
-            }
+            // 这一小片已经干完，回池子重新要活儿。
+            //
+            // 注意这里传的 live = 1：代表「我自己还占着一条连接」。
+            // 老实现传的是 0，而 splitTail 里 `if live <= 0 { return nil }`，
+            // 于是 worker 自己续做时**永远切不动尾部区间** —— 收尾阶段
+            // 池子一空，所有 worker 就只能干等，退化成单连接爬完最后一段。
+            guard let next = nextWork(pool: pool, live: 1, lanes: lanes, total: total) else { return }
+            current = next
         }
     }
 
     /// 分配下一段活儿：优先拿现成的；拿不到而连接还闲着，就从末尾切一刀。
+    ///
+    /// `live` 是「当前还有多少条连接在跑」。注意它**不能传 0**：
+    /// `splitTail` 里 `if live <= 0 { return nil }`，传 0 就等于禁止切分，
+    /// 收尾阶段池子一空就再也派不出活儿。调用方至少应传 1（代表自己这条在跑）。
     private func nextWork(pool: SlicePool, live: Int, lanes: Int, total: Int64) -> Chunk? {
         if let ready = pool.take() { return ready }
         guard live < lanes else { return nil }
         let remaining = max(total - pool.downloaded(), 0)
-        return pool.splitTail(live: live, target: sliceTarget(lanes: lanes, total: total, remaining: remaining))
+        return pool.splitTail(live: max(live, 1),
+                              target: sliceTarget(lanes: lanes, total: total, remaining: remaining))
     }
 
     /// 一个区间一次取多少：剩余数据越多取越大（少发请求），
@@ -1091,7 +1135,12 @@ final class DownloadEngine: @unchecked Sendable {
 
     // MARK: - 常量
 
-    private static let minSliceTarget: Int64 = 128 * 1024
+    /// 一次分片请求的目标字节数下限。
+    ///
+    /// 调到 64KB 是为了收尾阶段：剩余量少时，如果每片还按 128KB 取，
+    /// 最后那几 MB 只能被一两条连接瓜分，速度会「断崖式」掉下去。
+    /// 64KB 让尾段能摊给更多连接，末段也能贴着带宽跑完。
+    private static let minSliceTarget: Int64 = 64 * 1024
     private static let maxSliceTarget: Int64 = 4 * 1024 * 1024
     /// 小于这个体积不做分段：切来切去不如一条连接拉完
     private static let minChunkedTotal: Int64 = 4 * 1024 * 1024
@@ -1099,10 +1148,13 @@ final class DownloadEngine: @unchecked Sendable {
     private static let maxAttempts = 3
     private static let userAgent = "ArtifactBoost"
 
-    /// 渐进建连：每档放开多少条并发
-    private static let rampStep = 8
-    /// 渐进建连：每档之间间隔多久
-    private static let connectionRampInterval: TimeInterval = 0.25
+    /// 渐进建连：每档放开多少条并发。
+    ///
+    /// 爬坡的目的是避开「起步瞬间几百个请求同时砸过去 → 503 ServerBusy」，
+    /// 但步子太小会白白浪费前几秒带宽。16 是个平衡点。
+    private static let rampStep = 16
+    /// 渐进建连：每档之间间隔多久（配合 rampStep 决定爬坡总时长）
+    private static let connectionRampInterval: TimeInterval = 0.15
 
     private static func retryAfter(_ http: HTTPURLResponse) -> TimeInterval? {
         guard let raw = http.value(forHTTPHeaderField: "Retry-After")?.trimmingCharacters(in: .whitespaces),
