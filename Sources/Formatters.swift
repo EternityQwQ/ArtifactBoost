@@ -21,3 +21,33 @@ func formatCount(_ count: Int) -> String {
         return String(format: "%.1fm", Double(count) / 1_000_000)
     }
 }
+
+/// 相对时间：刚刚 / 5 分钟前 / 3 小时前 / 2 天前 / 4 个月前 / 1 年前
+/// （对齐 GitHub 的时间展示风格，比绝对日期更符合移动端的阅读习惯）
+func formatRelative(_ date: Date, now: Date = Date()) -> String {
+    let interval = now.timeIntervalSince(date)
+
+    // 未来时间（时钟偏差）统一显示为「刚刚」，避免出现「-3 分钟前」
+    guard interval >= 0 else { return "刚刚" }
+
+    if interval < 60 {
+        return "刚刚"
+    }
+    let minutes = Int(interval / 60)
+    if minutes < 60 {
+        return "\(minutes) 分钟前"
+    }
+    let hours = minutes / 60
+    if hours < 24 {
+        return "\(hours) 小时前"
+    }
+    let days = hours / 24
+    if days < 30 {
+        return "\(days) 天前"
+    }
+    let months = days / 30
+    if months < 12 {
+        return "\(months) 个月前"
+    }
+    return "\(months / 12) 年前"
+}
