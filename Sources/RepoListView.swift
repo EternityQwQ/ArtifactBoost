@@ -1,4 +1,5 @@
 import SwiftUI
+import UIKit
 
 struct RepoListView: View {
     @EnvironmentObject private var session: SessionManager
@@ -6,6 +7,8 @@ struct RepoListView: View {
     @State private var isLoading = false
     @State private var errorMessage: String?
     @State private var searchText = ""
+    // 绝区零彩蛋：长按导航栏「我的仓库」标题触发，二次确认后才跳官网，不做后台静默下载
+    @State private var showZzzEgg = false
 
     private var shownRepos: [GHRepo] {
         guard !searchText.isEmpty else { return repos }
@@ -50,6 +53,20 @@ struct RepoListView: View {
         }
         .listStyle(.insetGrouped)
         .navigationTitle("我的仓库")
+        .navigationBarTitleDisplayMode(.inline)
+        .toolbar {
+            // 彩蛋触发点放在导航栏标题上（与安卓端 TopAppBar 标题长按入口对齐）。
+            ToolbarItem(placement: .principal) {
+                Text("我的仓库")
+                    .font(.headline)
+                    .onLongPressGesture(minimumDuration: 0.6) {
+                        UIImpactFeedbackGenerator(style: .medium).impactOccurred()
+                        showZzzEgg = true
+                    }
+                    .accessibilityHint("长按发现彩蛋")
+            }
+        }
+        .zzzEasterEggAlert(isPresented: $showZzzEgg)
         .searchable(text: $searchText, prompt: "筛选我的仓库")
         .navigationDestination(for: GHRepo.self) { repo in
             RepoDetailView(repo: repo)
