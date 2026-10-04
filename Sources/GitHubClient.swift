@@ -6,6 +6,8 @@ enum GitHubError: LocalizedError {
     case http(Int, String)
     case artifactExpired
     case downloadURLNotFound
+    /// 解析签名地址整体超时（与安卓端同步）：文本直接面向用户，下载页失败态用得到
+    case requestTimeout
 
     var errorDescription: String? {
         switch self {
@@ -22,6 +24,7 @@ enum GitHubError: LocalizedError {
             }
         case .artifactExpired: return "该产物已过期，GitHub 已将其删除"
         case .downloadURLNotFound: return "未能获取产物下载地址"
+        case .requestTimeout: return "解析下载地址超时（30s）：直连 api.github.com 太慢，请检查网络后重试"
         }
     }
 }
@@ -66,6 +69,10 @@ final class GitHubClient: Sendable {
     func authorizedRequest(_ url: URL) -> URLRequest {
         var req = URLRequest(url: url)
         req.cachePolicy = .reloadIgnoringLocalCacheData
+        // 普通 API 单次 45s 封顶（与安卓端 apiClient callTimeout 对应）：
+        // URLSession.shared 改不了配置，只能逐请求设 idle 超时，
+        // 总时长另由各调用方的 withTimeout 兜底（如找测速目标 20s）。
+        req.timeoutInterval = 45
         req.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
         req.setValue("application/vnd.github+json", forHTTPHeaderField: "Accept")
         req.setValue("2022-11-28", forHTTPHeaderField: "X-GitHub-Api-Version")
@@ -186,6 +193,9 @@ final class GitHubClient: Sendable {
 
         let url = try makeURL(path)
         var request = authorizedRequest(url)
+        // 解析阶段永远直连 api.github.com：idle 30s 封顶（与安卓端 redirectClient 对应），
+        // 总时长另由 performDownload 的 30s 限时兜底。
+        request.timeoutInterval = 30
         for (key, value) in extraHeaders {
             request.setValue(value, forHTTPHeaderField: key)
         }
