@@ -120,7 +120,7 @@ struct SettingsView: View {
         } footer: {
             VStack(alignment: .leading, spacing: 6) {
                 Text(settings.mode.detail)
-                Text("并发数越大越能跑满带宽；绿色网络环境建议 32~64，一般 16 即可。设置会自动保存，下载时直接生效。")
+                Text("并发数越大越能跑满带宽；绿色网络环境建议 32~64，一般 16 即可，千兆内网/高速 Wi-Fi 可试 128。被限流时引擎会自动退让并把活儿转给健康通道，不会失败。设置会自动保存，下载时直接生效。")
                 if settings.mode == .smart {
                     Text("智能加速会额外尝试 ghfast.top —— 它只认 github.com 原始地址，因此**仅对发行版（Release）附件生效**，构建产物与日志仍走其它镜像。")
                 }

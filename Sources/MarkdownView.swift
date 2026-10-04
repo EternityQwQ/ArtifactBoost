@@ -31,9 +31,141 @@ enum MDBlock: Hashable, Sendable {
 }
 
 enum MarkdownParser {
+
+    /// README 里大量存在的**内嵌 HTML**（GitHub 允许 Markdown 里直接写 HTML）：
+    /// `<div align="center">`、`<h1>`、`<img>` badge、`<a>`、`<sub>`……
+    /// 我们的解析器只认 Markdown，HTML 标签会被当成纯文本吐出来，
+    /// 界面上就是一屏源码。
+    ///
+    /// 这里在解析前做一遍归一化：常见标签转成等效 Markdown（走既有渲染管线），
+    /// 不认识的标签剥壳保内容，HTML 实体解码（badge URL 里的 `&amp;` 全靠它）。
+    /// ``` 围栏代码块里的内容原样保留 —— 那是用户想展示的代码。
+    static func normalizeHtml(_ source: String) -> String {
+        // 按 ``` 围栏切开，围栏内的段落原样保留
+        let fence = try? NSRegularExpression(pattern: "(```[\\s\\S]*?```|```[\\s\\S]*)")
+        guard let fence else { return transformHtml(source) }
+        let ns = source as NSString
+        var out = ""
+        var last = 0
+        fence.enumerateMatches(in: source, range: NSRange(location: 0, length: ns.length)) { m, _, _ in
+            guard let m else { return }
+            if m.range.location > last {
+                out += transformHtml(ns.substring(with: NSRange(location: last, length: m.range.location - last)))
+            }
+            out += ns.substring(with: m.range)   // 围栏内原样保留
+            last = m.range.location + m.range.length
+        }
+        if last < ns.length { out += transformHtml(ns.substring(from: last)) }
+        return out
+    }
+
+    private static func transformHtml(_ text: String) -> String {
+        var s = text
+
+        // HTML 注释
+        s = regexReplace(s, "<!--[\\s\\S]*?-->") { _ in "" }
+
+        // <img src="X" alt="Y" ...> → ![Y](X)（属性任意顺序；width/height 忽略）
+        s = regexReplace(s, "<img\\s[^>]*>") { groups in
+            guard let src = htmlAttr(groups[0], "src") else { return "" }
+            let alt = htmlAttr(groups[0], "alt") ?? ""
+            return "![\(alt)](\(src))"
+        }
+
+        // <a href="X">内容</a> → [内容](X)（内容可能已含上面转换出的图片 → badge）
+        s = regexReplace(s, "<a\\s[^>]*href\\s*=\\s*[\"']([^\"']*)[\"'][^>]*>([\\s\\S]*?)</a>") { g in
+            "[\(g[2].trimmingCharacters(in: .whitespacesAndNewlines))](\(g[1]))"
+        }
+
+        // <h1>~<h6> → 标题；内容里有图片就降级成段落（标题渲染不了图）
+        s = regexReplace(s, "<h([1-6])(\\s[^>]*)?>([\\s\\S]*?)</h\\1>") { g in
+            let level = Int(g[1]) ?? 1
+            let inner = g[3].trimmingCharacters(in: .whitespacesAndNewlines)
+            if inner.isEmpty { return "" }
+            if inner.contains("](") { return "\n\(inner)\n" }
+            return "\n\(String(repeating: "#", count: level)) \(inner)\n"
+        }
+
+        // <b>/<strong>/<i>/<em> → Markdown 强调
+        s = replacing(s, "</?(?:b|strong)>", "**")
+        s = replacing(s, "</?(?:i|em)>", "*")
+
+        // <br> / <hr>
+        s = replacing(s, "<br\\s*/?>", "\n")
+        s = replacing(s, "<hr\\s*/?>", "\n---\n")
+
+        // <li> → 列表行（必须在通用剥壳之前）
+        s = replacing(s, "<li(\\s[^>]*)?>", "\n- ")
+
+        // 已知的纯排版标签：剥壳保内容（div/p/span/sub/sup/center/details…）
+        s = replacing(s, "</?(?:div|p|span|sub|sup|center|details|summary|kbd|samp|small|big|font|picture|source|figure|figcaption|ins|del|u|s|strike)(\\s[^>]*)?/?>", "")
+
+        // 兜底：其余任何未知标签也剥掉 —— 绝不让源码出现在界面上。
+        // 注意这在解码 HTML 实体**之前**：正文里的 `&lt;div&gt;` 此时还不是真标签，不受影响。
+        s = replacing(s, "</?[a-zA-Z][a-zA-Z0-9-]*(\\s[^<>]*)?/?>", "")
+
+        // HTML 实体解码（&amp; 常见于 shields badge URL 的参数里，不解会 404）
+        s = s.replacingOccurrences(of: "&amp;", with: "&")
+            .replacingOccurrences(of: "&lt;", with: "<")
+            .replacingOccurrences(of: "&gt;", with: ">")
+            .replacingOccurrences(of: "&quot;", with: "\"")
+            .replacingOccurrences(of: "&#39;", with: "'")
+            .replacingOccurrences(of: "&apos;", with: "'")
+            .replacingOccurrences(of: "&nbsp;", with: " ")
+
+        return s
+    }
+
+    /// 从 HTML 标签里取属性值（任意属性顺序，单双引号都认；要求属性名前有空白，避免误命中 data-src 之类）
+    private static func htmlAttr(_ tag: String, _ name: String) -> String? {
+        guard let re = try? NSRegularExpression(pattern: "(?:^|\\s)\(name)\\s*=\\s*[\"']([^\"']*)[\"']",
+                                                options: [.caseInsensitive]) else { return nil }
+        let ns = tag as NSString
+        guard let m = re.firstMatch(in: tag, range: NSRange(location: 0, length: ns.length)),
+              m.numberOfRanges > 1, m.range(at: 1).location != NSNotFound else { return nil }
+        return ns.substring(with: m.range(at: 1))
+    }
+
+    /// 正则模板替换（$1/$2 引用分组）
+    private static func replacing(_ input: String, _ pattern: String, _ template: String,
+                                  caseInsensitive: Bool = true) -> String {
+        var options: NSRegularExpression.Options = []
+        if caseInsensitive { options.insert(.caseInsensitive) }
+        guard let re = try? NSRegularExpression(pattern: pattern, options: options) else { return input }
+        let ns = input as NSString
+        return re.stringByReplacingMatches(in: input, range: NSRange(location: 0, length: ns.length),
+                                           withTemplate: template)
+    }
+
+    /// 带闭包的正则替换：handler 收到「整段匹配 + 各分组」
+    private static func regexReplace(_ input: String, _ pattern: String,
+                                     caseInsensitive: Bool = true,
+                                     _ handler: @escaping ([String]) -> String) -> String {
+        var options: NSRegularExpression.Options = []
+        if caseInsensitive { options.insert(.caseInsensitive) }
+        guard let re = try? NSRegularExpression(pattern: pattern, options: options) else { return input }
+        let ns = input as NSString
+        var out = ""
+        var last = 0
+        re.enumerateMatches(in: input, range: NSRange(location: 0, length: ns.length)) { m, _, _ in
+            guard let m else { return }
+            out += ns.substring(with: NSRange(location: last, length: m.range.location - last))
+            var groups: [String] = []
+            for i in 0..<m.numberOfRanges {
+                let r = m.range(at: i)
+                groups.append(r.location != NSNotFound && r.location <= ns.length ? ns.substring(with: r) : "")
+            }
+            out += handler(groups)
+            last = m.range.location + m.range.length
+        }
+        if last < ns.length { out += ns.substring(from: last) }
+        return out
+    }
+
     static func parse(_ source: String) -> [MDBlock] {
         var blocks: [MDBlock] = []
-        let lines = source.replacingOccurrences(of: "\r\n", with: "\n").components(separatedBy: "\n")
+        let normalized = normalizeHtml(source)
+        let lines = normalized.replacingOccurrences(of: "\r\n", with: "\n").components(separatedBy: "\n")
         var index = 0
 
         while index < lines.count {

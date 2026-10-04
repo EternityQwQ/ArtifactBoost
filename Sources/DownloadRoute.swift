@@ -113,7 +113,12 @@ struct AccelerationSettings {
     var testedAt: Date?
 
     static let `default` = AccelerationSettings()
-    static let connectionOptions = [8, 16, 32, 64]
+    /// 设置页档位
+    /// 128 属于极限档：吃千兆内网/高速 Wi-Fi 用，普通宽带吃不满，
+    /// 且更容易被 CDN 限流（引擎会自动退让，不会失败）。
+    static let connectionOptions = [8, 16, 32, 64, 128]
+    /// 引擎接受的并发上限
+    static let maxConnections = 128
 
     private enum Keys {
         static let connections = "ab.connections"
@@ -157,7 +162,7 @@ struct AccelerationSettings {
         }
     }
 
-    var clampedConnections: Int { max(1, min(connections, 64)) }
+    var clampedConnections: Int { max(1, min(connections, Self.maxConnections)) }
 
     /// 当前设置下的候选通道（直连永远保留兜底）
     ///
