@@ -47,7 +47,8 @@ enum RepoSort: String, CaseIterable, Identifiable {
     }
 }
 
-final class GitHubClient {
+/// 无可变状态（仅 token），声明 Sendable 以便测速限时等后台任务安全捕获
+final class GitHubClient: Sendable {
     let token: String
 
     init(token: String) {

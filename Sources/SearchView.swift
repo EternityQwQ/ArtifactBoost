@@ -144,16 +144,50 @@ struct SearchView: View {
     static func parseFullName(_ raw: String) -> String? {
         var text = raw.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !text.isEmpty else { return nil }
-        if !text.contains("://") {
-            text = "https://" + text
+        // 从 Markdown 里复制时常见的 <https://github.com/owner/repo> 包裹
+        if text.hasPrefix("<") && text.hasSuffix(">") && text.count >= 2 {
+            text = String(text.dropFirst().dropLast())
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !text.isEmpty else { return nil }
         }
-        guard let url = URL(string: text), let host = url.host?.lowercased(), host.contains("github.com") else {
+
+        let lower = text.lowercased()
+        let looksLikeURL = text.contains("://") || lower.contains("github.com")
+        if !looksLikeURL {
+            // 裸 owner/repo 分支：之前实现强制要求 host 含 github.com，
+            // 导致最常见的 "cli/cli" 输入永远返回 nil（与安卓端同因，安卓端已修复，此处同步）。
+            let clean = text.split(separator: "?")[0].split(separator: "#")[0]
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            let parts = clean.split(separator: "/")
+                .map { $0.trimmingCharacters(in: .whitespaces) }
+                .filter { !$0.isEmpty }
+            guard parts.count >= 2 else { return nil }
+            let owner = String(parts[0])
+            var repo = String(parts[1])
+            if repo.lowercased().hasSuffix(".git") { repo = String(repo.dropLast(4)) }
+            guard isValidRepoPart(owner) && isValidRepoPart(repo) else { return nil }
+            return "\(owner)/\(repo)"
+        }
+
+        let withScheme = text.contains("://") ? text : "https://" + text
+        guard let url = URL(string: withScheme),
+              let host = url.host?.lowercased(),
+              host.contains("github.com") else {
             return nil
         }
-        var parts = url.path.split(separator: "/").map(String.init)
-        guard parts.count >= 2 else { return nil }
-        parts = Array(parts.prefix(2))
-        let fullName = parts.joined(separator: "/")
+        let pathParts = url.path.split(separator: "/").map(String.init)
+        guard pathParts.count >= 2 else { return nil }
+        var repo = pathParts[1]
+        if repo.lowercased().hasSuffix(".git") { repo = String(repo.dropLast(4)) }
+        guard isValidRepoPart(pathParts[0]) && isValidRepoPart(repo) else { return nil }
+        let fullName = "\(pathParts[0])/\(repo)"
         return fullName.isEmpty ? nil : fullName
+    }
+
+    private static let repoNamePartRegex = try! NSRegularExpression(pattern: "^[A-Za-z0-9_.-]+$")
+
+    private static func isValidRepoPart(_ s: String) -> Bool {
+        let range = NSRange(s.startIndex..., in: s)
+        return repoNamePartRegex.firstMatch(in: s, range: range) != nil
     }
 }
