@@ -1,4 +1,5 @@
 import SwiftUI
+import UIKit
 
 /// 设置：账户 + 加速设置（并发 / 通道）+ 通道测速 + 关于
 struct SettingsView: View {
@@ -6,6 +7,8 @@ struct SettingsView: View {
     @EnvironmentObject private var downloads: DownloadManager
 
     @State private var settings = AccelerationSettings.load()
+    // 原神彩蛋：长按导航栏「设置」标题触发，二次确认后才跳官网，不做后台静默下载
+    @State private var showGenshinEgg = false
     @State private var isTesting = false
     @State private var testResults: [ScoredRoute] = []
     @State private var testTargetLabel: String?
@@ -21,6 +24,21 @@ struct SettingsView: View {
         }
         .listStyle(.insetGrouped)
         .navigationTitle("设置")
+        .navigationBarTitleDisplayMode(.inline)
+        .toolbar {
+            // 原生 TabView 的 tabItem 不支持长按，彩蛋触发点放在导航栏标题上
+            //（与安卓端设置页 TopAppBar 标题长按兜底入口对齐）。
+            ToolbarItem(placement: .principal) {
+                Text("设置")
+                    .font(.headline)
+                    .onLongPressGesture(minimumDuration: 0.6) {
+                        UIImpactFeedbackGenerator(style: .medium).impactOccurred()
+                        showGenshinEgg = true
+                    }
+                    .accessibilityHint("长按发现彩蛋")
+            }
+        }
+        .genshinEasterEggAlert(isPresented: $showGenshinEgg)
         .onAppear {
             // 下载过程中可能自动记录过测速结果，回到设置页时同步一下
             settings = AccelerationSettings.load()

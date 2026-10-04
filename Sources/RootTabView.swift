@@ -23,6 +23,8 @@ struct RootTabView: View {
             NavigationStack {
                 SettingsView()
             }
+            // 彩蛋：原生 tabItem 不支持长按，长按导航栏「设置」标题触发
+            //（二次确认后跳原神官网 ys.mihoyo.com，见 GenshinEasterEgg.swift）。
             .tabItem { Label("设置", systemImage: "gearshape.fill") }
         }
         .tint(Theme.accent)
