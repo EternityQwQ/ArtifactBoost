@@ -22,7 +22,7 @@ struct SearchView: View {
                     HStack(spacing: 10) {
                         Image(systemName: "link")
                             .foregroundStyle(Theme.muted)
-                        TextField("owner/repo 或 GitHub 链接", text: $directInput)
+                        TextField("owner/repo 或 Actions 链接", text: $directInput)
                             .textInputAutocapitalization(.never)
                             .autocorrectionDisabled()
                             .keyboardType(.URL)
@@ -39,9 +39,9 @@ struct SearchView: View {
                         ErrorBanner(text: directError)
                     }
                 } header: {
-                    Text("直接打开仓库")
+                    Text("直接打开仓库 / Actions")
                 } footer: {
-                    Text("贴一个仓库地址就能进去下载，例如 cli/cli 或 https://github.com/cli/cli")
+                    Text("贴仓库地址进仓库主页；贴 actions/runs 链接直达该次构建，例如 https://github.com/owner/repo/actions/runs/37171664473")
                 }
 
                 if let errorMessage {
@@ -93,6 +93,9 @@ struct SearchView: View {
             .navigationDestination(for: GHRepo.self) { repo in
                 RepoDetailView(repo: repo)
             }
+            .navigationDestination(for: RunDestination.self) { dest in
+                RunDetailView(repo: dest.repo, run: dest.run)
+            }
         }
     }
 
@@ -123,8 +126,8 @@ struct SearchView: View {
 
     private func openDirect() async {
         guard let client = session.client else { return }
-        guard let fullName = Self.parseFullName(directInput) else {
-            directError = "格式不对，示例：cli/cli 或 https://github.com/cli/cli"
+        guard let target = Self.parseDirectTarget(directInput) else {
+            directError = "格式不对，示例：cli/cli 或 https://github.com/cli/cli/actions/runs/123456"
             return
         }
         isOpening = true
@@ -132,16 +135,43 @@ struct SearchView: View {
         errorMessage = nil
         defer { isOpening = false }
         do {
-            let repo = try await client.repo(fullName: fullName)
-            directInput = ""
-            path.append(repo)
+            switch target {
+            case .repo(let fullName):
+                let repo = try await client.repo(fullName: fullName)
+                directInput = ""
+                path.append(repo)
+            case .run(let fullName, let runID):
+                // actions 链接：先拿仓库再拿单次运行，直跳构建详情而非仓库主页
+                let repo = try await client.repo(fullName: fullName)
+                let run = try await client.workflowRun(fullName: fullName, runID: runID)
+                directInput = ""
+                path.append(RunDestination(repo: repo, run: run))
+            }
         } catch {
             directError = session.message(for: error)
         }
     }
 
-    /// 支持 owner/repo、github.com/owner/repo、完整链接（多余路径会被截掉）
-    static func parseFullName(_ raw: String) -> String? {
+    /// 直接打开的目标：仓库主页，或某次 Actions 运行（构建详情）。
+    ///
+    /// 支持：
+    /// - owner/repo
+    /// - https://github.com/owner/repo
+    /// - https://github.com/owner/repo/actions/runs/37171664473
+    ///   （后面再跟 /jobs/…、/attempts/…、?query、#fragment 都会被忽略，只取 runId）
+    /// - 裸 owner/repo/actions/runs/37171664473（无 scheme 的简写同样识别）
+    enum DirectTarget: Hashable {
+        case repo(String)
+        case run(fullName: String, runID: Int64)
+    }
+
+    /// NavigationStack 直达构建详情用：同时带上仓库与运行（RunDetailView 需要两者）。
+    struct RunDestination: Hashable {
+        let repo: GHRepo
+        let run: GHWorkflowRun
+    }
+
+    static func parseDirectTarget(_ raw: String) -> DirectTarget? {
         var text = raw.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !text.isEmpty else { return nil }
         // 从 Markdown 里复制时常见的 <https://github.com/owner/repo> 包裹
@@ -166,7 +196,15 @@ struct SearchView: View {
             var repo = String(parts[1])
             if repo.lowercased().hasSuffix(".git") { repo = String(repo.dropLast(4)) }
             guard isValidRepoPart(owner) && isValidRepoPart(repo) else { return nil }
-            return "\(owner)/\(repo)"
+            let fullName = "\(owner)/\(repo)"
+            // 裸 actions 简写：owner/repo/actions/runs/<runId>
+            if parts.count >= 5,
+               parts[2].lowercased() == "actions",
+               parts[3].lowercased() == "runs",
+               let runID = Int64(parts[4]), runID > 0 {
+                return .run(fullName: fullName, runID: runID)
+            }
+            return .repo(fullName)
         }
 
         let withScheme = text.contains("://") ? text : "https://" + text
@@ -181,7 +219,26 @@ struct SearchView: View {
         if repo.lowercased().hasSuffix(".git") { repo = String(repo.dropLast(4)) }
         guard isValidRepoPart(pathParts[0]) && isValidRepoPart(repo) else { return nil }
         let fullName = "\(pathParts[0])/\(repo)"
-        return fullName.isEmpty ? nil : fullName
+        // actions 链接：…/owner/repo/actions/runs/<runId>[…]，大小写不敏感，多余后缀忽略
+        for i in pathParts.indices {
+            if pathParts[i].lowercased() == "actions",
+               i + 2 < pathParts.count,
+               pathParts[i + 1].lowercased() == "runs",
+               let runID = Int64(pathParts[i + 2]), runID > 0 {
+                return .run(fullName: fullName, runID: runID)
+            }
+        }
+        return .repo(fullName)
+    }
+
+    /// 支持 owner/repo、github.com/owner/repo、完整链接（多余路径会被截掉）。
+    /// actions/runs 链接会退化为仓库名（只取 owner/repo 部分）。
+    static func parseFullName(_ raw: String) -> String? {
+        switch parseDirectTarget(raw) {
+        case .repo(let fullName): return fullName
+        case .run(let fullName, _): return fullName
+        case nil: return nil
+        }
     }
 
     private static let repoNamePartRegex = try! NSRegularExpression(pattern: "^[A-Za-z0-9_.-]+$")

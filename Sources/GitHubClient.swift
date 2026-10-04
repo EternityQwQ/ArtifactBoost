@@ -135,6 +135,11 @@ final class GitHubClient: Sendable {
         return resp.workflowRuns
     }
 
+    /// 取单次 workflow 运行（「直接打开 Actions 链接」用）
+    func workflowRun(fullName: String, runID: Int64) async throws -> GHWorkflowRun {
+        try await get("repos/\(fullName)/actions/runs/\(runID)")
+    }
+
     /// 某次运行产生的产物列表
     func artifacts(repo: GHRepo, run: GHWorkflowRun) async throws -> [GHArtifact] {
         let resp: ArtifactsResponse = try await get(
