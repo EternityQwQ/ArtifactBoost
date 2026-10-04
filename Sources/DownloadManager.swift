@@ -191,7 +191,14 @@ final class DownloadManager: ObservableObject {
 
     // MARK: - 下载主流程
 
+    /// 解析签名地址单次限时 30s（与安卓端同步），重试前退避 1.5s
+    static let resolveTimeout: TimeInterval = 30
+    static let resolveRetryDelay: TimeInterval = 1.5
+
     /// 解析签名地址 → 选通道 → 下载。签名地址有时效，整体失败后重新解析再试一次。
+    ///
+    /// 解析阶段永远直连 api.github.com（通道只影响下载阶段），弱网下单次可达 30s；
+    /// 这里做了三件事避免“一直转”：单次 30s 限时、重试前退避 1.5s、重试时刷出明确文案。
     private func performDownload(item: DownloadItem,
                                  client: GitHubClient,
                                  engine: DownloadEngine,
@@ -200,7 +207,14 @@ final class DownloadManager: ObservableObject {
         var lastError: Error = DownloadError.badResponse
         for attempt in 0..<2 {
             do {
-                let signed = try await client.resolveDownloadURL(for: item.source)
+                if attempt > 0 {
+                    // 让用户看出来是在重试，而不是卡死
+                    routeSummary[item.id] = "正在解析下载地址（重试 \(attempt)/1）…"
+                    try await Task.sleep(nanoseconds: UInt64(Self.resolveRetryDelay * 1_000_000_000))
+                }
+                let signed = try await Self.resolveWithTimeout(client: client, source: item.source)
+                // 解析成功：清掉可能存在的“重试…”文案，后面测速/下载会刷自己的说明
+                routeSummary[item.id] = nil
                 return try await run(item: item,
                                      engine: engine,
                                      signedURL: signed,
@@ -213,6 +227,21 @@ final class DownloadManager: ObservableObject {
             }
         }
         throw lastError
+    }
+
+    /// 30s 内拿不到签名地址就抛 requestTimeout（中文文案见 GitHubError）。
+    /// 取消优先透出 CancellationError，不会被包装成超时再白跑一次重试。
+    private static func resolveWithTimeout(client: GitHubClient, source: DownloadSource) async throws -> URL {
+        try await withThrowingTaskGroup(of: URL.self) { group in
+            group.addTask { try await client.resolveDownloadURL(for: source) }
+            group.addTask {
+                try await Task.sleep(nanoseconds: UInt64(resolveTimeout * 1_000_000_000))
+                throw GitHubError.requestTimeout
+            }
+            guard let first = try await group.next() else { throw CancellationError() }
+            group.cancelAll()
+            return first
+        }
     }
 
     private func run(item: DownloadItem,
@@ -328,7 +357,7 @@ final class DownloadManager: ObservableObject {
         if isCancellation(error) { return false }
         guard let ghError = error as? GitHubError else { return true }
         switch ghError {
-        case .badResponse:
+        case .badResponse, .requestTimeout:
             return true
         case .http(let code, _):
             return code >= 500 || code == 429
