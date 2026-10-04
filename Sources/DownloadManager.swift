@@ -2,7 +2,7 @@ import Foundation
 import UIKit
 
 /// 测速用的真实目标（优先产物，其次构建日志）
-struct SpeedTestTarget {
+struct SpeedTestTarget: Sendable {
     let url: URL
     let label: String
     let isPrivate: Bool
@@ -150,8 +150,23 @@ final class DownloadManager: ObservableObject {
     }
 
     /// 设置页测速用：在用户自己的仓库里找一个真实的下载目标
+    ///
+    /// 找目标限时 20s（与安卓端同步）：内部是串行网络请求
+    /// （仓库→构建→产物→签名地址），而 API 请求走 `URLSession.shared`
+    /// （默认 60s 请求超时），整体不限时会让设置页转圈一分钟以上。
+    /// 超时返回 nil，调用方按“无可用目标”提示。
+    static let findTestTargetTimeout: TimeInterval = 20
+
     func findTestTarget() async -> SpeedTestTarget? {
         guard let client = session.client else { return nil }
+        switch await withTimeout(seconds: Self.findTestTargetTimeout,
+                                 operation: { [client] in await Self.findTestTargetUnsafe(client: client) }) {
+        case .completed(let target): return target
+        case .timedOut: return nil
+        }
+    }
+
+    private static func findTestTargetUnsafe(client: GitHubClient) async -> SpeedTestTarget? {
         guard let repos = try? await client.repos(page: 1) else { return nil }
         // 公开仓库优先：私有仓库的签名地址不应该交给镜像去测速
         let ordered = repos.sorted { ($0.isPrivate ? 1 : 0, $0.name) < ($1.isPrivate ? 1 : 0, $1.name) }

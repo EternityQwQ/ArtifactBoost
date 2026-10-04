@@ -47,7 +47,8 @@ enum RepoSort: String, CaseIterable, Identifiable {
     }
 }
 
-final class GitHubClient {
+/// 无可变状态（仅 token），声明 Sendable 以便测速限时等后台任务安全捕获
+final class GitHubClient: Sendable {
     let token: String
 
     init(token: String) {
@@ -132,6 +133,11 @@ final class GitHubClient {
             query: [URLQueryItem(name: "per_page", value: "30")]
         )
         return resp.workflowRuns
+    }
+
+    /// 取单次 workflow 运行（「直接打开 Actions 链接」用）
+    func workflowRun(fullName: String, runID: Int64) async throws -> GHWorkflowRun {
+        try await get("repos/\(fullName)/actions/runs/\(runID)")
     }
 
     /// 某次运行产生的产物列表

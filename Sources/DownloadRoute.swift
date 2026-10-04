@@ -213,6 +213,12 @@ enum RouteProbe {
     static let sampleBytes: Int64 = 512 * 1024
     static let timeout: TimeInterval = 8
 
+    /// 测速限时机制（与安卓端同步的思想）：
+    /// 单通道 8s（URLSession 请求超时），整体默认 15s。
+    /// 整体超时时不再死等最慢的那条，直接返回已完成通道的部分结果；
+    /// 调用方（设置页/下载前）按“部分结果”继续选路，空结果则回退直连。
+    static let totalTimeout: TimeInterval = 15
+
     /// 探测专用会话：限制总时长，防止某个通道不认 Range 时把整个文件都拉进内存
     private static let session: URLSession = {
         let config = URLSessionConfiguration.ephemeral
@@ -221,16 +227,19 @@ enum RouteProbe {
         return URLSession(configuration: config)
     }()
 
-    /// 并发测量所有通道，返回按速度从快到慢排序的结果（失败的通道会被丢掉）
+    /// 并发测量所有通道，返回按速度从快到慢排序的结果（失败/超时的通道会被丢掉）
     ///
     /// - Parameter knownSize: 已知体积时从文件中段取样，避开 TCP 慢启动
     /// - Parameter githubURL: ghfast 这类 `.githubOnly` 通道只能用它测
+    /// - Parameter timeout: 整体限时；超时后取消未完成通道并返回部分结果
     static func measureAll(among routes: [DownloadRoute],
                            signedURL: URL,
                            githubURL: URL? = nil,
                            sampleLimit: Int64 = sampleBytes,
-                           knownSize: Int64? = nil) async -> [ScoredRoute] {
+                           knownSize: Int64? = nil,
+                           timeout: TimeInterval = totalTimeout) async -> [ScoredRoute] {
         let limit = max(64 * 1024, min(sampleLimit, sampleBytes))
+        let deadline = Date().addingTimeInterval(timeout)
         let results = await withTaskGroup(of: ScoredRoute?.self) { group in
             for route in routes {
                 let target: URL? = {
@@ -245,6 +254,11 @@ enum RouteProbe {
             var collected: [ScoredRoute] = []
             for await result in group {
                 if let result { collected.append(result) }
+                // 整体超时：砍掉还在爬的慢通道，快通道的结果已收割，不再死等
+                if Date() >= deadline {
+                    group.cancelAll()
+                    break
+                }
             }
             return collected
         }
@@ -273,5 +287,27 @@ enum RouteProbe {
               !data.isEmpty else { return nil }
         let elapsed = max(Date().timeIntervalSince(start), 0.05)
         return ScoredRoute(route: route, speed: Double(data.count) / elapsed)
+    }
+}
+
+/// 限时执行的结果：正常完成 vs 超时（Swift 没有 withTimeout 原语，这里用任务竞速实现）
+enum TimeoutOutcome<T: Sendable>: Sendable {
+    case completed(T)
+    case timedOut
+}
+
+/// 带限时的执行：超时返回 `.timedOut`，并取消未完成的工作。
+/// 用于给串行网络循环（找测速目标）加总保险，与安卓端的 withTimeoutOrNull 对应。
+func withTimeout<T: Sendable>(seconds: TimeInterval,
+                              operation: @escaping @Sendable () async -> T) async -> TimeoutOutcome<T> {
+    await withTaskGroup(of: TimeoutOutcome<T>.self) { group in
+        group.addTask { .completed(await operation()) }
+        group.addTask {
+            try? await Task.sleep(nanoseconds: UInt64(seconds * 1_000_000_000))
+            return .timedOut
+        }
+        guard let first = await group.next() else { return .timedOut }
+        group.cancelAll()
+        return first
     }
 }

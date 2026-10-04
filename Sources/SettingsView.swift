@@ -259,6 +259,9 @@ struct SettingsView: View {
         if target.isPrivate {
             text += "（测速对象来自私有仓库，只测了直连，不会把地址交给镜像）"
         }
+        if measured.count < candidates.count {
+            text += "（部分通道超时已跳过）"
+        }
         testMessage = text
     }
 }
