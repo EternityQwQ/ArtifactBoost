@@ -303,6 +303,8 @@ final class DownloadManager: ObservableObject {
     /// 只有网络类错误才值得重试；权限、产物已删除等错误直接抛出
     private static func shouldRetry(_ error: Error) -> Bool {
         if isCancellation(error) { return false }
+        // 空间不足重试没有意义，直接失败提示用户清理
+        if (error as? DownloadError) == .noSpace { return false }
         guard let ghError = error as? GitHubError else { return true }
         switch ghError {
         case .badResponse, .requestTimeout:

@@ -81,6 +81,8 @@ enum DownloadError: LocalizedError, Equatable {
     case incomplete
     /// 服务器忽略 Range 头（回 200 全量）：这条地址不能用于分段下载
     case noRangeSupport
+    /// 磁盘空间不够：重试没有意义，直接失败提示用户清理
+    case noSpace
     /// 服务器明确要求我们慢一点（429 / 503 等），需要按 Retry-After 退避
     case throttled(code: Int, retryAfter: TimeInterval?)
 
@@ -90,6 +92,7 @@ enum DownloadError: LocalizedError, Equatable {
         case .cancelled: return "下载已取消"
         case .incomplete: return "下载失败：数据校验不通过（可能断流），请重试"
         case .noRangeSupport: return "下载失败：该通道不支持分段下载"
+        case .noSpace: return "下载失败：存储空间不足，请清理后重试"
         case .throttled(let code, _): return "下载失败：服务器限流（\(code)）"
         }
     }
@@ -97,7 +100,7 @@ enum DownloadError: LocalizedError, Equatable {
     static func == (lhs: DownloadError, rhs: DownloadError) -> Bool {
         switch (lhs, rhs) {
         case (.badResponse, .badResponse), (.cancelled, .cancelled), (.incomplete, .incomplete),
-             (.noRangeSupport, .noRangeSupport):
+             (.noRangeSupport, .noRangeSupport), (.noSpace, .noSpace):
             return true
         case let (.throttled(a, _), .throttled(b, _)):
             return a == b
@@ -115,10 +118,164 @@ struct DownloadResult {
 }
 
 /// 一个待下载的区间（左闭右闭）。区间只记 start/end，砍成两半不需要给任何 worker 重新编号。
-private struct Chunk: Sendable {
+private struct Chunk: Sendable, Equatable {
     let start: Int64
     let end: Int64
     var length: Int64 { end - start + 1 }
+}
+
+/// 已完成区间归一化：裁剪到 [0, total)，丢弃非法，合并重叠/相邻（与安卓端一致）。
+private func normalizeChunks(_ ranges: [Chunk], total: Int64) -> [Chunk] {
+    guard total > 0 else { return [] }
+    let clipped = ranges.compactMap { c -> Chunk? in
+        let s = min(max(c.start, 0), total - 1)
+        let e = min(max(c.end, 0), total - 1)
+        return s <= e ? Chunk(start: s, end: e) : nil
+    }.sorted { $0.start < $1.start }
+    guard !clipped.isEmpty else { return [] }
+    var out: [Chunk] = []
+    var cs = clipped[0].start
+    var ce = clipped[0].end
+    for c in clipped.dropFirst() {
+        if c.start <= ce + 1 {
+            ce = max(ce, c.end)
+        } else {
+            out.append(Chunk(start: cs, end: ce))
+            cs = c.start
+            ce = c.end
+        }
+    }
+    out.append(Chunk(start: cs, end: ce))
+    return out
+}
+
+/// 差集：从 chunk 里挖掉 drops，返回剩余片段（保持顺序，drops 需有序；与安卓端一致）。
+private func subtractChunk(_ chunk: Chunk, drops: [Chunk]) -> [Chunk] {
+    var out: [Chunk] = []
+    var cur = chunk.start
+    for d in drops {
+        if d.end < cur || d.start > chunk.end { continue }
+        if d.start > cur { out.append(Chunk(start: cur, end: min(d.start - 1, chunk.end))) }
+        cur = max(cur, d.end + 1)
+        if cur > chunk.end { break }
+    }
+    if cur <= chunk.end { out.append(Chunk(start: cur, end: chunk.end)) }
+    return out
+}
+
+/// 断点续传的账本：已完成区间（内存合并）+ sidecar 落盘（节流）。
+///
+/// 格式自定纯文本（`total=123\\nranges=0-99,200-299`），编解码纯 Swift。
+/// 落盘走原子写（atomically），杀进程时 sidecar 要么完整要么缺失，绝不半截：
+/// 解析失败即视为无续传，从头下（与安卓端 `ResumeTracker` 一致）。
+private final class ResumeTracker: @unchecked Sendable {
+    private let lock = NSLock()
+    private var done: [Chunk] = []
+    private var lastCheckpoint = Date.distantPast
+    let total: Int64
+    let sidecar: URL
+    let checkpointInterval: TimeInterval
+
+    init(sidecar: URL, total: Int64, checkpointInterval: TimeInterval = 2) {
+        self.sidecar = sidecar
+        self.total = total
+        self.checkpointInterval = checkpointInterval
+    }
+
+    func seed(_ ranges: [Chunk]) {
+        lock.lock()
+        done = normalizeChunks(ranges, total: total)
+        lock.unlock()
+    }
+
+    /// 插入单区间并与邻居合并；done 恒有序不重叠，单次 O(n)，n 通常只有前沿宽度
+    func markDone(start: Int64, end: Int64) {
+        guard end >= start, total > 0 else { return }
+        var s = min(max(start, 0), total - 1)
+        var e = min(max(end, 0), total - 1)
+        guard e >= s else { return }
+        lock.lock()
+        var i = 0
+        while i < done.count, done[i].end < s - 1 { i += 1 }
+        var j = i
+        while j < done.count, done[j].start <= e + 1 {
+            s = min(s, done[j].start)
+            e = max(e, done[j].end)
+            j += 1
+        }
+        done.removeSubrange(i..<j)
+        done.insert(Chunk(start: s, end: e), at: i)
+        lock.unlock()
+    }
+
+    func snapshot() -> [Chunk] {
+        lock.lock(); defer { lock.unlock() }
+        return done
+    }
+
+    func bytesDone() -> Int64 {
+        lock.lock(); defer { lock.unlock() }
+        return done.reduce(0) { $0 + $1.length }
+    }
+
+    func encode() -> String {
+        lock.lock(); defer { lock.unlock() }
+        return "total=\(total)\nranges=" + done.map { "\($0.start)-\($0.end)" }.joined(separator: ",")
+    }
+
+    func maybeCheckpoint(force: Bool = false) {
+        lock.lock()
+        let due = force || Date().timeIntervalSince(lastCheckpoint) >= checkpointInterval
+        lock.unlock()
+        guard due else { return }
+        // 原子写：要么完整新版，要么保留旧版
+        try? encode().write(to: sidecar, atomically: true, encoding: .utf8)
+        lock.lock()
+        lastCheckpoint = Date()
+        lock.unlock()
+    }
+
+    func delete() {
+        try? FileManager.default.removeItem(at: sidecar)
+    }
+
+    /// 严格解析，任何变形都返回 nil（调用方视为无续传，从头下）。
+    static func parse(_ raw: String) -> (Int64, [Chunk])? {
+        let lines = raw.components(separatedBy: "\n")
+        guard lines.count >= 2,
+              lines[0].hasPrefix("total="), lines[1].hasPrefix("ranges="),
+              let total = Int64(String(lines[0].dropFirst("total=".count))), total > 0 else { return nil }
+        let body = String(lines[1].dropFirst("ranges=".count))
+        if body.isEmpty { return (total, []) }
+        var ranges: [Chunk] = []
+        for seg in body.components(separatedBy: ",") {
+            let se = seg.components(separatedBy: "-")
+            guard se.count == 2, let s = Int64(se[0]), let e = Int64(se[1]), s <= e else { return nil }
+            ranges.append(Chunk(start: s, end: e))
+        }
+        return (total, normalizeChunks(ranges, total: total))
+    }
+
+    /// 续传准入：part 长度必须恰为 total，账本 total 必须一致，
+    /// 任一不满足都删掉重来 —— 宁可重下，不写坏文件。
+    static func loadResumeRanges(sidecar: URL, part: URL, total: Int64) -> [Chunk] {
+        let fm = FileManager.default
+        let partSize = ((try? fm.attributesOfItem(atPath: part.path))?[.size] as? NSNumber)?.int64Value
+        guard partSize == total else {
+            try? fm.removeItem(at: part)
+            try? fm.removeItem(at: sidecar)
+            return []
+        }
+        guard fm.fileExists(atPath: sidecar.path),
+              let raw = try? String(contentsOf: sidecar, encoding: .utf8),
+              let parsed = parse(raw), parsed.0 == total else {
+            // 有数据没账本 / 账本损坏 / total 变了：不敢信，删掉重下
+            try? fm.removeItem(at: part)
+            try? fm.removeItem(at: sidecar)
+            return []
+        }
+        return parsed.1
+    }
 }
 
 /// 待下载区间的池子（滑动窗口）
@@ -179,6 +336,27 @@ private final class SlicePool: @unchecked Sendable {
         lock.lock(); queue.insert(chunk, at: 0); checkInvariantsLocked(); lock.unlock()
     }
 
+    /// 续传：从队列里挖掉已完成区间，返回已完成字节数。
+    /// 调用方据此 seed 进度（accumulator / tracker），三者必须同源，
+    /// 否则进度条与 pool 脱节、收尾判定会错（与安卓端一致）。
+    @discardableResult
+    func excludeDone(_ done: [Chunk]) -> Int64 {
+        let norm = normalizeChunks(done, total: total)
+        guard !norm.isEmpty else { return 0 }
+        lock.lock()
+        var kept: [Chunk] = []
+        kept.reserveCapacity(queue.count)
+        while !queue.isEmpty {
+            kept.append(contentsOf: subtractChunk(queue.removeFirst(), drops: norm))
+        }
+        queue = kept
+        let bytes = norm.reduce(0) { $0 + $1.length }
+        completed += bytes
+        checkInvariantsLocked()
+        lock.unlock()
+        return bytes
+    }
+
     /// 池子空了、但还有连接闲着时调用：从队列末尾挑一段砍成两半
     func splitTail(live: Int, target: Int) -> Chunk? {
         guard live > 0 else { return nil }
@@ -224,22 +402,26 @@ private final class SlicePool: @unchecked Sendable {
 
 /// 汇总各分块进度，节流后回调给 UI
 private actor ProgressAccumulator {
-    private var downloaded: Int64 = 0
+    private var downloaded: Int64
     private let total: Int64
     private let handler: @Sendable (DownloadProgress) -> Void
     /// 快照来源：每拍现取一次车道看板，拿到的就是「此刻」而不是「启动时」的明细
     private let diagnostics: (@Sendable () -> DownloadDiagnostics?)?
     private var lastEmit = Date.distantPast
     private var lastSampleTime = Date()
-    private var lastSampleBytes: Int64 = 0
+    private var lastSampleBytes: Int64
     private var smoothedSpeed: Double = 0
     private var zeroStreak = 0
 
+    /// - Parameter initialBytes: 续传起点，已完成字节，进度条从这里起算而不是从 0
     init(total: Int64,
          handler: @escaping @Sendable (DownloadProgress) -> Void,
+         initialBytes: Int64 = 0,
          diagnostics: (@Sendable () -> DownloadDiagnostics?)? = nil) {
         self.total = total
         self.handler = handler
+        self.downloaded = initialBytes
+        self.lastSampleBytes = initialBytes
         self.diagnostics = diagnostics
     }
 
@@ -289,9 +471,9 @@ private actor ProgressAccumulator {
     }
 }
 
-/// 一次分片请求的结果
+/// 一次分片请求的结果（流式落盘后只剩记账，不再携带整片数据）
 private struct SliceOutcome: Sendable {
-    let data: Data
+    let received: Int
     let elapsed: TimeInterval
 }
 
@@ -574,9 +756,12 @@ final class DownloadEngine: @unchecked Sendable {
         let outDir = fm.urls(for: .documentDirectory, in: .userDomainMask)[0]
             .appendingPathComponent("Artifacts", isDirectory: true)
         try fm.createDirectory(at: outDir, withIntermediateDirectories: true)
-        var outURL = outDir.appendingPathComponent(fileName)
-        if fm.fileExists(atPath: outURL.path) {
-            outURL = outDir.appendingPathComponent("\(UUID().uuidString.prefix(6))-\(fileName)")
+        // 小文件 / 未知体积走单连接（不续传）：存在则换名避让
+        func uniqueOut() -> URL {
+            let base = outDir.appendingPathComponent(fileName)
+            return fm.fileExists(atPath: base.path)
+                ? outDir.appendingPathComponent("\(UUID().uuidString.prefix(6))-\(fileName)")
+                : base
         }
 
         // 极限档并发意味着几百条 socket：先把 fd soft limit 顶到 hard 上限，
@@ -593,7 +778,7 @@ final class DownloadEngine: @unchecked Sendable {
             // 探测不到体积（不少接口不回 Content-Length）：
             // 先单连接跑，只要响应是 206 就现场升级成多线程分段
             let single = try await downloadSingle(url: urls[0],
-                                                 into: outURL,
+                                                 into: uniqueOut(),
                                                  lanes: lanes,
                                                  progress: progress)
             return DownloadResult(fileURL: single.url,
@@ -604,7 +789,7 @@ final class DownloadEngine: @unchecked Sendable {
         guard probe?.chunked == true, total >= Self.minChunkedTotal else {
             // 服务器忽略了 Range（返回 200 全量），或者文件太小不值得分段
             let single = try await downloadSingle(url: urls[0],
-                                                 into: outURL,
+                                                 into: uniqueOut(),
                                                  lanes: lanes,
                                                  progress: progress)
             return DownloadResult(fileURL: single.url,
@@ -612,12 +797,28 @@ final class DownloadEngine: @unchecked Sendable {
                                   lanes: single.lanes)
         }
 
-        let fileURL = try await segmentDownload(urls: urls,
-                                                total: total,
-                                                outURL: outURL,
-                                                lanes: lanes,
-                                                plan: plan,
-                                                progress: progress)
+        // 大文件分段路径：固定 part 文件名 + sidecar 账本，支持断点续传。
+        // 同一 fileName 重下即自发现续传（预检与续传加载都在 segmentDownload 内部）。
+        let partURL = outDir.appendingPathComponent("\(fileName).part")
+        let sidecarURL = outDir.appendingPathComponent("\(fileName).part.ranges")
+        let part = try await segmentDownload(urls: urls,
+                                             total: total,
+                                             partURL: partURL,
+                                             sidecarURL: sidecarURL,
+                                             lanes: lanes,
+                                             plan: plan,
+                                             progress: progress)
+        try? fm.removeItem(at: sidecarURL)
+        // 落到最终名：已存在则换名避让（与旧行为一致）；同目录 move 一般必成
+        var fileURL = outDir.appendingPathComponent(fileName)
+        if fm.fileExists(atPath: fileURL.path) {
+            fileURL = outDir.appendingPathComponent("\(UUID().uuidString.prefix(6))-\(fileName)")
+        }
+        do {
+            try fm.moveItem(at: part, to: fileURL)
+        } catch {
+            fileURL = part // move 失败则直接用 part 兜底（数据本身是完整的）
+        }
         return DownloadResult(fileURL: fileURL,
                               averageSpeed: Self.speed(bytes: total, since: startedAt),
                               lanes: lanes)
@@ -639,7 +840,8 @@ final class DownloadEngine: @unchecked Sendable {
     /// 那正是老实现里「一条慢连接独自收尾，其余连接全部空转」造成的。
     private func segmentDownload(urls: [URL],
                                  total: Int64,
-                                 outURL: URL,
+                                 partURL: URL,
+                                 sidecarURL: URL,
                                  lanes: Int,
                                  plan: [ScoredRoute],
                                  progress: @escaping @Sendable (DownloadProgress) -> Void) async throws -> URL {
@@ -649,7 +851,16 @@ final class DownloadEngine: @unchecked Sendable {
         // 通道列表要等 session 建好才有，这里先留一个可回填的盒子。
         let channelsBox = ChannelsBox()
 
-        let accumulator = ProgressAccumulator(total: total, handler: progress) {
+        // 续传自发现：part+账本都在且 total 一致才认，否则删掉从头下
+        let resumeRanges = ResumeTracker.loadResumeRanges(sidecar: sidecarURL, part: partURL, total: total)
+        // 磁盘预检：只看还缺的字节，不够直接失败（重试无意义）。
+        // 注意查父目录可用空间：part 文件全新下载时还不存在，对它 statfs 必失败。
+        let seedBytes = resumeRanges.reduce(0) { $0 + $1.length }
+        let parentPath = partURL.deletingLastPathComponent().path
+        let freeBytes = ((try? FileManager.default.attributesOfFileSystem(forPath: parentPath))?[.systemFreeSize] as? NSNumber)?.int64Value ?? 0
+        if freeBytes < total - seedBytes { throw DownloadError.noSpace }
+
+        let accumulator = ProgressAccumulator(total: total, handler: progress, initialBytes: seedBytes) {
             let active = Set(board.liveLanes().map { $0.routeName })
             return board.snapshot(routes: channelsBox.value.map {
                 RouteStats(name: $0.name,
@@ -697,13 +908,33 @@ final class DownloadEngine: @unchecked Sendable {
         let laneCounter = Counter()
 
         let fm = FileManager.default
-        try? fm.removeItem(at: outURL)
-        guard fm.createFile(atPath: outURL.path, contents: nil) else { throw DownloadError.badResponse }
-        let handle = try FileHandle(forWritingTo: outURL)
+        if resumeRanges.isEmpty {
+            // 全新下载才清场；续传命中时 part 数据必须原样保留
+            try? fm.removeItem(at: partURL)
+        }
+        if !fm.fileExists(atPath: partURL.path) {
+            guard fm.createFile(atPath: partURL.path, contents: nil) else { throw DownloadError.badResponse }
+        }
+        let handle = try FileHandle(forWritingTo: partURL)
         defer { try? handle.close() }
-        try handle.truncate(atOffset: UInt64(total))
+        do {
+            // 续传命中时长度已是 total，直接保留数据；否则预分配
+            let currentSize = ((try? fm.attributesOfItem(atPath: partURL.path))?[.size] as? NSNumber)?.uint64Value ?? 0
+            if currentSize != UInt64(total) {
+                try handle.truncate(atOffset: UInt64(total))
+            }
+        } catch {
+            try? handle.close()
+            if let dlError = error as? DownloadError { throw dlError }
+            throw DownloadError.noSpace
+        }
 
         let pool = SlicePool(total: total)
+        // 续传挖除：pool / tracker / accumulator 三者同源，缺一就会进度脱节
+        let excludedBytes = pool.excludeDone(resumeRanges)
+        assert(excludedBytes == seedBytes, "续传记账不一致: pool=\(excludedBytes) accumulator=\(seedBytes)")
+        let tracker = ResumeTracker(sidecar: sidecarURL, total: total)
+        tracker.seed(resumeRanges)
         let sink = WriteSink(handle: handle)
 
         try await withThrowingTaskGroup(of: Void.self) { group in
@@ -793,9 +1024,10 @@ final class DownloadEngine: @unchecked Sendable {
                                        pool: pool,
                                        lanes: lanes,
                                        total: total,
-                                       sink: sink,
-                                       accumulator: accumulator,
-                                       board: board)
+                                        sink: sink,
+                                        accumulator: accumulator,
+                                        board: board,
+                                        tracker: tracker)
                         board.remove(laneId)
                         // worker 自己结算并发名额：调度循环永远不需要
                         // 阻塞收割（group.next() 等一个 worker 干到退出
@@ -827,13 +1059,15 @@ final class DownloadEngine: @unchecked Sendable {
         if isCancelled { throw DownloadError.cancelled }
         if sink.failed { throw DownloadError.incomplete }
 
-        let size = ((try? fm.attributesOfItem(atPath: outURL.path))?[.size] as? Int64) ?? 0
+        let size = ((try? fm.attributesOfItem(atPath: partURL.path))?[.size] as? Int64) ?? 0
         guard size == total else {
-            try? fm.removeItem(at: outURL)
+            // 失败不断 part：part+账本留给下次续传（只重试缺的区间）
             throw DownloadError.incomplete
         }
+        // 成功即删账本
+        tracker.delete()
         await accumulator.finish(downloaded: total)
-        return outURL
+        return partURL
     }
 
     // MARK: - 一个 worker 的生命周期
@@ -849,7 +1083,8 @@ final class DownloadEngine: @unchecked Sendable {
                           total: Int64,
                           sink: WriteSink,
                           accumulator: ProgressAccumulator,
-                          board: LaneBoard) async {
+                          board: LaneBoard,
+                          tracker: ResumeTracker) async {
         var current = initial
 
         while !isCancelled {
@@ -896,6 +1131,7 @@ final class DownloadEngine: @unchecked Sendable {
 
             do {
                 let (outcome, winner, finalURL) = try await fetchSlice(chunk: Chunk(start: from, end: to),
+                                                                        sink: sink,
                                                                         pool: pool,
                                                                         board: board,
                                                                         laneId: laneId,
@@ -903,13 +1139,16 @@ final class DownloadEngine: @unchecked Sendable {
                                                                         channels: channels,
                                                                         tailIsolated: Self.isTailRemaining(remaining: remaining,
                                                                                                            lanes: lanes))
-                if !outcome.data.isEmpty {
-                    sink.write(outcome.data, at: from)
-                    pool.recordDone(Int64(outcome.data.count))
-                    await accumulator.advance(Int64(outcome.data.count))
-                    winner.observe(elapsed: outcome.elapsed, bytes: Int64(outcome.data.count))
+                if outcome.received > 0 {
+                    // 流式落盘已在 fetchSlice 内写完，这里只记账
+                    pool.recordDone(Int64(outcome.received))
+                    await accumulator.advance(Int64(outcome.received))
+                    winner.observe(elapsed: outcome.elapsed, bytes: Int64(outcome.received))
                     board.bumpDoneSlice()
                     board.reward(winner.name)
+                    // 断点续传记账：落盘节流，避免每片都写文件
+                    tracker.markDone(start: from, end: from + Int64(outcome.received) - 1)
+                    tracker.maybeCheckpoint()
 
                     let seconds = max(outcome.elapsed, 0.001)
                     board.update(LaneSnapshot(laneId: laneId,
@@ -917,15 +1156,15 @@ final class DownloadEngine: @unchecked Sendable {
                                               url: finalURL.absoluteString,
                                               start: from,
                                               end: to,
-                                              downloaded: Int64(outcome.data.count),
-                                              speedBytesPerSecond: Double(outcome.data.count) / seconds,
+                                              downloaded: Int64(outcome.received),
+                                              speedBytesPerSecond: Double(outcome.received) / seconds,
                                               state: .done,
                                               attempt: 1,
                                               lastStatus: 206))
                 }
-                if outcome.data.count < want {
+                if outcome.received < want {
                     // 没取满（连接中途断了）：把缺的那一段还回池子重取，绝不丢数据
-                    let missing = Chunk(start: from + Int64(outcome.data.count), end: to)
+                    let missing = Chunk(start: from + Int64(outcome.received), end: to)
                     if missing.length > 0 { pool.putBack(missing) }
                 }
             } catch {
@@ -982,7 +1221,17 @@ final class DownloadEngine: @unchecked Sendable {
     /// 越接近尾声取越小（让所有连接都能分到收尾的活儿）。
     private func sliceTarget(lanes: Int, total: Int64, remaining: Int64) -> Int {
         let share = (max(remaining, 0) / Int64(lanes * 4)) * 2
-        return Int(min(max(share, Self.minSliceTarget), Self.maxSliceTarget))
+        return Int(min(max(share, Self.minSliceTarget), Self.maxSlice(for: total)))
+    }
+
+    /// 大文件自适应分片上限：文件越大单片越大，用更少的请求数跑完，
+    /// QPS 降下来才不会撞上 Azure/Cloudflare 的 429/503 线。
+    /// 流式落盘后大片不再占内存（每片只用 64KB 读缓冲），放量是安全的
+    ///（与安卓端 `maxSliceFor` 一致）。
+    private static func maxSlice(for total: Int64) -> Int64 {
+        if total >= 2 * 1024 * 1024 * 1024 { return 16 * 1024 * 1024 }
+        if total >= 1 * 1024 * 1024 * 1024 { return 8 * 1024 * 1024 }
+        return maxSliceTarget
     }
 
     /// 是否进入「尾段」：剩余数据已经不够把所有 lane 按最小片喂饱。
@@ -1004,16 +1253,16 @@ final class DownloadEngine: @unchecked Sendable {
     ///（与安卓端 `bdpFloorBytes` 一致）。
     private static let tailBdpSeconds = 0.25
 
-    private static func bdpFloorBytes(measuredSpeed: Double) -> Int {
-        Int(min(max(measuredSpeed * tailBdpSeconds, 0), Double(maxSliceTarget)))
+    private static func bdpFloorBytes(measuredSpeed: Double, maxSlice: Int64 = maxSliceTarget) -> Int {
+        Int(min(max(measuredSpeed * tailBdpSeconds, 0), Double(maxSlice)))
     }
 
     /// 结合剩余量与通道速度算出本片要多少字节（与安卓端 `sliceWant` 一致）。
     private static func sliceWant(lanes: Int, total: Int64, remaining: Int64,
                                   currentLen: Int, measuredSpeed: Double) -> Int {
         let base = Int(min(max((max(remaining, 0) / Int64(lanes * 4)) * 2,
-                               minSliceTarget), maxSliceTarget))
-        let want = max(base, min(bdpFloorBytes(measuredSpeed: measuredSpeed), currentLen))
+                               minSliceTarget), maxSlice(for: total)))
+        let want = max(base, min(bdpFloorBytes(measuredSpeed: measuredSpeed, maxSlice: maxSlice(for: total)), currentLen))
         return min(max(want, 1), max(currentLen, 1))
     }
 
@@ -1081,6 +1330,7 @@ final class DownloadEngine: @unchecked Sendable {
     /// 全程只用局部变量选地址，不再变异共享 `RouteChannel`，并发重试互不踩。
     /// 返回成功时的实际通道，调用方按它做 `observe/reward`，限流标记不张冠李戴。
     private func fetchSlice(chunk: Chunk,
+                            sink: WriteSink,
                             pool: SlicePool,
                             board: LaneBoard,
                             laneId: Int,
@@ -1127,45 +1377,34 @@ final class DownloadEngine: @unchecked Sendable {
             request.cachePolicy = .reloadIgnoringLocalCacheData
             request.setValue("bytes=\(chunk.start)-\(chunk.end)", forHTTPHeaderField: "Range")
             request.setValue(Self.userAgent, forHTTPHeaderField: "User-Agent")
-            // 定稿后冻结：group 子任务闭包按值捕获，避免 `var` 捕获告警
+            // 定稿后冻结，后面只读不再改
             let finishedRequest = request
 
             let startedAt = Date()
             do {
-                // 慢片超时：单片总耗时封顶，超时即放弃本片走换线重试，
-                // 把区间让给快通道 —— 尾段不再被一条卡住的连接 gate 住。
-                // 安卓端是在读循环里查 deadline；URLSession 整包返回，这里做成竞速超时，
-                // 超时胜出时抛出的 incomplete 会走既有重试换线，group 退出时顺带掐掉慢请求。
-                let timeoutMs = Self.sliceTimeoutMs(length: chunk.length)
-                let (data, response): (Data, URLResponse) = try await withThrowingTaskGroup(of: (Data, URLResponse).self) { grp in
-                    grp.addTask { [self] in try await self.send(finishedRequest, on: active.session) }
-                    grp.addTask {
-                        try await Task.sleep(for: .milliseconds(Int(timeoutMs)))
-                        throw DownloadError.incomplete
-                    }
-                    guard let first = try await grp.next() else { throw DownloadError.incomplete }
-                    grp.cancelAll()
-                    return first
-                }
+                // 流式落盘：读 64KB 写 64KB，整片不再驻留内存。
+                // 大文件 × 高并发下峰值内存从 lanes×slice（可达数百 MB）
+                // 降到 lanes×64KB，否则 128 并发必 OOM。
+                // 附带修好 200 全量回退：以前整包进内存（GB 级直接爆），
+                // 现在只取前 wantLen 字节就停，剩余直接丢弃。
+                // bytes(for:) 不暴露 URLSessionTask：取消靠 Task 取消（for-await 自动抛），
+                // 引擎 cancel 则靠 sessions.invalidateAndCancel，下面的 catch 会翻译成 cancelled。
+                let wantLen = Int(chunk.length)
+                let deadline = Date(timeIntervalSinceNow: TimeInterval(Self.sliceTimeoutMs(length: chunk.length)) / 1000)
+                let (stream, response) = try await active.session.bytes(for: finishedRequest)
                 guard let http = response as? HTTPURLResponse else { throw DownloadError.badResponse }
 
                 switch http.statusCode {
                 case 206:
                     // 兜底（直连）成功不代表镜像恢复，不清除镜像限流标记
                     if !isFallbackURL { active.setThrottled(false) }
-                    guard !data.isEmpty else { throw DownloadError.incomplete }
-                    return (SliceOutcome(data: data, elapsed: Date().timeIntervalSince(startedAt)), active, targetURL)
                 case 200:
                     // 服务器忽略了 Range（回 200 全量）。这多半意味着这条地址
                     // 不支持分段：交给重试逻辑换条线（下轮自动选别的通道）。
                     // 唯一能救的是 start==0 的片 —— 数据本来就是从 0 开始的，
-                    // 截取前 want 字节照样是对的（URLSession 已把整个响应读进来，
-                    // prefix 只是截取引用段，不会二次拷贝整个文件）。
+                    // 读满 wantLen 即停，不会把整个响应吃进内存。
                     guard chunk.start == 0 else { throw DownloadError.noRangeSupport }
                     if !isFallbackURL { active.setThrottled(false) }
-                    let head = data.prefix(Int(chunk.length))
-                    guard head.count > 0 else { throw DownloadError.incomplete }
-                    return (SliceOutcome(data: Data(head), elapsed: Date().timeIntervalSince(startedAt)), active, targetURL)
                 case 429, 503:
                     pool.recordThrottle()
                     board.bumpThrottle()
@@ -1178,6 +1417,34 @@ final class DownloadEngine: @unchecked Sendable {
                 default:
                     throw DownloadError.badResponse
                 }
+
+                var received = 0
+                var buf = Data()
+                buf.reserveCapacity(Self.streamBufferBytes)
+                for try await byte in stream {
+                    buf.append(byte)
+                    // 攒满一块再检查落盘：逐字节查时间又贵又没必要
+                    guard buf.count >= Self.streamBufferBytes || received + buf.count >= wantLen else { continue }
+                    if isCancelled || inflight.isCancelling || Task.isCancelled { throw DownloadError.cancelled }
+                    // 慢片超时：单片总耗时封顶，超时即放弃本片走换线重试，
+                    // 把区间让给快通道 —— 尾段不再被一条卡住的连接 gate 住（与安卓端一致）。
+                    if Date() > deadline { throw DownloadError.incomplete }
+                    let n = min(buf.count, wantLen - received)
+                    sink.write(Data(buf.prefix(n)), at: chunk.start + Int64(received))
+                    received += n
+                    buf.removeAll(keepingCapacity: true)
+                    if received >= wantLen { break }
+                }
+                // 收尾：不足一块的余量
+                if !buf.isEmpty, received < wantLen {
+                    if isCancelled || inflight.isCancelling || Task.isCancelled { throw DownloadError.cancelled }
+                    let n = min(buf.count, wantLen - received)
+                    sink.write(Data(buf.prefix(n)), at: chunk.start + Int64(received))
+                    received += n
+                }
+                if sink.failed { throw DownloadError.incomplete }
+                guard received > 0 else { throw DownloadError.incomplete }
+                return (SliceOutcome(received: received, elapsed: Date().timeIntervalSince(startedAt)), active, targetURL)
             } catch {
                 // 取消优先级最高：无论是标志位还是 Task 取消，都直接向外抛
                 if isCancelled || inflight.isCancelling { throw DownloadError.cancelled }
@@ -1320,12 +1587,24 @@ final class DownloadEngine: @unchecked Sendable {
             try? FileManager.default.createDirectory(at: upgradeDir, withIntermediateDirectories: true)
             defer { try? FileManager.default.removeItem(at: upgradeDir) }
 
-            let fileURL = try await segmentDownload(urls: [url],
-                                                    total: total,
-                                                    outURL: outURL,
-                                                    lanes: lanes,
-                                                    plan: [ScoredRoute(route: .direct, speed: 1)],
-                                                    progress: progress)
+            // 升级路径同样走 part+账本（以 outURL 派生），不断点续传不断流
+            let dir = outURL.deletingLastPathComponent()
+            let part = try await segmentDownload(urls: [url],
+                                                 total: total,
+                                                 partURL: dir.appendingPathComponent("\(outURL.lastPathComponent).part"),
+                                                 sidecarURL: dir.appendingPathComponent("\(outURL.lastPathComponent).part.ranges"),
+                                                 lanes: lanes,
+                                                 plan: [ScoredRoute(route: .direct, speed: 1)],
+                                                 progress: progress)
+            try? FileManager.default.removeItem(at: dir.appendingPathComponent("\(outURL.lastPathComponent).part.ranges"))
+            // outURL 已是避让后的唯一名，move 必成；失败则用 part 兜底（数据本身是完整的）
+            let fileURL: URL
+            do {
+                try FileManager.default.moveItem(at: part, to: outURL)
+                fileURL = outURL
+            } catch {
+                fileURL = part
+            }
             return (fileURL, total, lanes)
         }
 
@@ -1411,6 +1690,8 @@ final class DownloadEngine: @unchecked Sendable {
     /// 64KB 让尾段能摊给更多连接，末段也能贴着带宽跑完。
     private static let minSliceTarget: Int64 = 64 * 1024
     private static let maxSliceTarget: Int64 = 4 * 1024 * 1024
+    /// 流式落盘的读缓冲：每片只用这么多内存，与分片大小无关
+    private static let streamBufferBytes = 64 * 1024
     /// 小于这个体积不做分段：切来切去不如一条连接拉完
     private static let minChunkedTotal: Int64 = 4 * 1024 * 1024
     private static let singleProbeBytes: Int64 = 64 * 1024
